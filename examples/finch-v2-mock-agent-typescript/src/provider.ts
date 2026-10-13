@@ -473,6 +473,15 @@ class VerificationRejection extends Error {
 // ============================================================
 // LLM client (OpenAI-compatible chat completions)
 // ============================================================
+// We use the official openai SDK with a custom baseURL. The SDK transparently
+// appends /chat/completions and handles auth, retries, JSON encoding/decoding,
+// streaming, and typed responses. Works against any OpenAI-compatible gateway
+// (agw.k0s.io, OpenRouter, Together, etc.).
+//
+// In Node: import from 'openai' (resolves via package.json + node_modules).
+// In Deno: the import map in deno.json maps 'openai' to 'npm:openai@^4'.
+
+import OpenAI from 'openai';
 
 class LlmError extends Error {
   constructor(public code: string, message: string) {
@@ -480,81 +489,60 @@ class LlmError extends Error {
   }
 }
 
-interface LlmChatResponse {
-  choices?: Array<{
-    message?: { role?: string; content?: string | null };
-    finish_reason?: string;
-  }>;
-  error?: { code?: string; message?: string; type?: string };
+let _openaiClient: OpenAI | null = null;
+let _openaiClientConfig: LlmConfig | null = null;
+
+function openaiClient(llm: LlmConfig): OpenAI {
+  if (_openaiClient && _openaiClientConfig === llm) return _openaiClient;
+  // The SDK requires a non-empty apiKey; pass a sentinel when the gateway
+  // accepts the literal "-".
+  const apiKey = llm.apiKey || '-';
+  const baseURL = llm.baseUrl.replace(/\/+$/, '') + '/v1';
+  _openaiClient = new OpenAI({
+    apiKey,
+    baseURL,
+    timeout: llm.timeoutMs ?? 30000,
+    maxRetries: 0, // we surface errors to the caller; no silent retry
+  });
+  _openaiClientConfig = llm;
+  return _openaiClient;
 }
 
 async function callLlm(llm: LlmConfig, userText: string): Promise<string> {
-  const baseUrl = llm.baseUrl.replace(/\/+$/, '');
-  const url = `${baseUrl}/v1/chat/completions`;
-  const body = JSON.stringify({
-    model: llm.model,
-    messages: [
-      ...(llm.systemPrompt ? [{ role: 'system', content: llm.systemPrompt }] : []),
-      { role: 'user', content: userText },
-    ],
-    max_tokens: llm.maxTokens ?? 1024,
-  });
+  const client = openaiClient(llm);
+  const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
+  if (llm.systemPrompt) messages.push({ role: 'system', content: llm.systemPrompt });
+  messages.push({ role: 'user', content: userText });
 
-  const timeoutMs = llm.timeoutMs ?? 30000;
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'Content-Length': String(Buffer.byteLength(body)),
-  };
-  if (llm.apiKey) headers['Authorization'] = `Bearer ${llm.apiKey}`;
-
-  const raw = await new Promise<Buffer>((resolve, reject) => {
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      reject(new LlmError('llm_bad_url', `invalid baseUrl: ${llm.baseUrl}`));
-      return;
-    }
-    const req = httpRequest(
-      {
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method: 'POST',
-        headers,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-        res.on('error', reject);
-      },
-    );
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new LlmError('llm_timeout', `request timed out after ${timeoutMs}ms`));
-    });
-    req.on('error', (e) => reject(new LlmError('llm_network', e.message)));
-    req.write(body);
-    req.end();
-  });
-
-  let parsedJson: LlmChatResponse;
   try {
-    parsedJson = JSON.parse(raw.toString('utf8')) as LlmChatResponse;
-  } catch {
-    throw new LlmError('llm_bad_response', `non-JSON response: ${raw.toString('utf8').slice(0, 200)}`);
+    const resp = await client.chat.completions.create({
+      model: llm.model,
+      messages,
+      max_tokens: llm.maxTokens ?? 1024,
+    });
+    const text = resp.choices[0]?.message?.content;
+    if (typeof text !== 'string' || text.length === 0) {
+      throw new LlmError('llm_empty', 'LLM returned no text content');
+    }
+    return text;
+  } catch (err: unknown) {
+    // The SDK throws an APIError with status / code / message.
+    if (err instanceof OpenAI.APIError) {
+      throw new LlmError(
+        `llm_${err.status}`,
+        `${err.code ?? 'api_error'}: ${err.message}`,
+      );
+    }
+    if (err instanceof OpenAI.APIConnectionError) {
+      throw new LlmError('llm_network', err.message);
+    }
+    if (err instanceof OpenAI.APIConnectionTimeoutError) {
+      throw new LlmError('llm_timeout', err.message);
+    }
+    if (err instanceof LlmError) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new LlmError('llm_error', msg);
   }
-  if (parsedJson.error) {
-    throw new LlmError(
-      parsedJson.error.code ?? 'llm_error',
-      parsedJson.error.message ?? 'unknown upstream error',
-    );
-  }
-  const text = parsedJson.choices?.[0]?.message?.content;
-  if (typeof text !== 'string' || text.length === 0) {
-    throw new LlmError('llm_empty', 'LLM returned no text content');
-  }
-  return text;
 }
 
 // ============================================================

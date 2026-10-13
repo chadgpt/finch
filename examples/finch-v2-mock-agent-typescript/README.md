@@ -33,6 +33,11 @@ LLM at `https://agw.k0s.io` with model `MiniMax-M3`, and uses the model's
 text response as the Agent's reply. P2 / P3 behavior is unchanged (they
 still ask for clarification / echo a mock artifact).
 
+The integration uses the official [`openai`](https://www.npmjs.com/package/openai)
+SDK (v4) — not a hand-rolled HTTP request. The SDK handles auth, JSON
+encoding/decoding, timeouts, and typed errors. To switch to any other
+OpenAI-compatible gateway, just change `LLM_BASE_URL` and `LLM_MODEL`.
+
 Verify it works locally:
 
 ```bash
@@ -40,7 +45,7 @@ Verify it works locally:
 #    or set inline in Node)
 deno task start
 
-# 2. in another terminal, send a signed P1 turn with curl
+# 2. in another terminal, send a signed P1 turn
 python3 - <<'PY'
 import base64, hmac, hashlib, time, uuid, urllib.request, json, os
 key = base64.urlsafe_b64decode(os.environ['MOCK_REQUEST_SECRET'])
@@ -67,6 +72,9 @@ PY
 ```
 
 You should see the LLM's reply in the `message.content[0].text` field.
+End-to-end verified 2026-10-13: a real call to agw.k0s.io with model
+`MiniMax-M3` returned `"HELLO"` (after a 1-2s warm-up).
+
 If the gateway returns an error (e.g. quota), the provider responds with
 `status: "failed"` and an `error.code` you can use for retry logic.
 
@@ -74,12 +82,21 @@ If the gateway returns an error (e.g. quota), the provider responds with
 
 | Var | Default | Notes |
 |---|---|---|
-| `LLM_BASE_URL` | `https://agw.k0s.io` | Code appends `/v1/chat/completions` |
-| `LLM_API_KEY` | `-` | Sentinel; the gateway accepts an empty/literal `-` Bearer |
+| `LLM_BASE_URL` | `https://agw.k0s.io` | SDK appends `/v1/chat/completions` |
+| `LLM_API_KEY` | `-` | Sentinel; the gateway accepts the literal `-` Bearer |
 | `LLM_MODEL` | `MiniMax-M3` | Verified working model id on this gateway |
 | `LLM_SYSTEM_PROMPT` | `You are a helpful agent. Be concise.` | Prepended to every turn |
 | `LLM_MAX_TOKENS` | `1024` | Per-response cap |
 | `LLM_TIMEOUT_MS` | `30000` | Aborts the HTTP request |
+
+### Switching to Anthropic-style calls
+
+The agw.k0s.io gateway also accepts Anthropic-style POSTs at
+`/v1/messages`. To use the Anthropic SDK instead of the openai SDK,
+replace the `import OpenAI from 'openai'` and the `client.chat.completions.create`
+call in `src/provider.ts` with the equivalent `Anthropic` SDK call. The
+wire-level request shape changes (`system` becomes a top-level field
+instead of a message), but the ProviderConfig env vars stay the same.
 
 ### Disabling the LLM (echo fallback)
 
@@ -159,8 +176,10 @@ headers.
 - **P1 sync + P2 async + P3 generation** with deterministic `merchant_task_id`
   and HMAC-SHA256 signed responses.
 - **Strict TypeScript** (`noUncheckedIndexedAccess`, strict mode).
-- **No runtime dependencies** — uses only Node 22+ / Deno 2.x built-ins
-  (`node:crypto`, `node:http`, `node:net`, `node:process`).
+- **No runtime dependencies beyond `openai` SDK** — uses Node 22+ / Deno 2.x
+  built-ins (`node:crypto`, `node:http`, `node:net`, `node:process`) plus
+  the official `openai@^4` package (mapped via `npm:` in Deno, installed
+  normally in Node).
 - **Self-contained test** — no Finch account, no external network.
 
 ## What this is NOT

@@ -5,6 +5,7 @@
     "check": "deno check src/provider.ts test/self_test.ts"
   },
   "imports": {
+    "openai": "npm:openai@^4.104.0",
     "node:crypto": "node:crypto",
     "node:http": "node:http",
     "node:net": "node:net",
