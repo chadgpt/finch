@@ -58,3 +58,7 @@ External analyses (not part of this repo, but built on the same sources):
 | `docs/README.md` (43 KB) | 2026-10-04 | `curl https://www.finchtech.ai/market/agents/docs` |
 | `examples/finch-v2-mock-agent/` (25 KB) | 2026-10-04 | `curl https://www.finchtech.ai/downloads/finch-v2-mock-agent.zip`, SHA-256 verified against SOURCE.md |
 | `examples/finch-v2-mock-agent-typescript/` (29 KB) | 2026-10-13 | Ported from the Python mock; verified 6/6 tests pass in Deno 2.9.7 and Node 22.19 |
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
