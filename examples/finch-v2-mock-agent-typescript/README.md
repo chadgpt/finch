@@ -26,6 +26,71 @@ npm start            # starts provider
 npm run typecheck    # tsc --noEmit
 ```
 
+## Talking to a real LLM
+
+By default the P1 `conversation_turn` branch calls a real OpenAI-compatible
+LLM at `https://agw.k0s.io` with model `MiniMax-M3`, and uses the model's
+text response as the Agent's reply. P2 / P3 behavior is unchanged (they
+still ask for clarification / echo a mock artifact).
+
+Verify it works locally:
+
+```bash
+# 1. start the provider (env vars are read from .env via --env-file in Deno,
+#    or set inline in Node)
+deno task start
+
+# 2. in another terminal, send a signed P1 turn with curl
+python3 - <<'PY'
+import base64, hmac, hashlib, time, uuid, urllib.request, json, os
+key = base64.urlsafe_b64decode(os.environ['MOCK_REQUEST_SECRET'])
+body = json.dumps({
+  "protocol_version": "2.0",
+  "invocation_id": str(uuid.uuid4()),
+  "interaction_mode": "conversation_turn",
+  "input": {"content": [{"type":"text","text":"Reply with exactly the word HELLO and nothing else."}]},
+}).encode()
+ts, n = str(int(time.time())), uuid.uuid4().hex
+canonical = f"POST\n/invoke\n{ts}\n{n}\n{hashlib.sha256(body).hexdigest()}"
+sig = "v1=" + hmac.new(key, canonical.encode(), hashlib.sha256).hexdigest()
+req = urllib.request.Request(
+  "http://127.0.0.1:28891/invoke", data=body, method="POST",
+  headers={
+    "Content-Type": "application/json",
+    "Idempotency-Key": uuid.uuid4().hex,
+    "X-Platform-Key-Id": os.environ["MOCK_KEY_ID"],
+    "X-Platform-Timestamp": ts, "X-Platform-Nonce": n, "X-Platform-Signature": sig,
+  })
+with urllib.request.urlopen(req, timeout=30) as r:
+    print(r.read().decode())
+PY
+```
+
+You should see the LLM's reply in the `message.content[0].text` field.
+If the gateway returns an error (e.g. quota), the provider responds with
+`status: "failed"` and an `error.code` you can use for retry logic.
+
+### LLM env vars
+
+| Var | Default | Notes |
+|---|---|---|
+| `LLM_BASE_URL` | `https://agw.k0s.io` | Code appends `/v1/chat/completions` |
+| `LLM_API_KEY` | `-` | Sentinel; the gateway accepts an empty/literal `-` Bearer |
+| `LLM_MODEL` | `MiniMax-M3` | Verified working model id on this gateway |
+| `LLM_SYSTEM_PROMPT` | `You are a helpful agent. Be concise.` | Prepended to every turn |
+| `LLM_MAX_TOKENS` | `1024` | Per-response cap |
+| `LLM_TIMEOUT_MS` | `30000` | Aborts the HTTP request |
+
+### Disabling the LLM (echo fallback)
+
+The test harness sets `llm: undefined` in its `ProviderConfig` to keep
+the original deterministic echo behavior. To do the same at runtime,
+omit `LLM_BASE_URL`:
+
+```bash
+LLM_BASE_URL= deno task start   # falls back to "P1 mock 已完成:<text>"
+```
+
 ### Expose it on a public HTTPS URL (for contract test / live demo)
 
 The mock binds to `127.0.0.1`, so Finch cannot reach it directly.

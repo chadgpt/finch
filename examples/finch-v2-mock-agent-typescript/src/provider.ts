@@ -200,17 +200,40 @@ export interface ProviderConfig {
   port: number;
   agentName: string;
   debugSign: boolean;
+  /** Optional OpenAI-compatible LLM backend for P1 conversation. */
+  llm?: LlmConfig;
+}
+
+export interface LlmConfig {
+  /** Base URL, e.g. https://agw.k0s.io — code will append /v1/chat/completions. */
+  baseUrl: string;
+  /** API key; pass the literal "-" if the gateway accepts a sentinel. */
+  apiKey: string;
+  /** Model id, e.g. "MiniMax-M3" or "minimax-china/MiniMax-M3". */
+  model: string;
+  /** Optional system prompt prepended to every conversation. */
+  systemPrompt?: string;
+  /** Max tokens for the LLM response. Default 1024. */
+  maxTokens?: number;
+  /** Request timeout in ms. Default 30000. */
+  timeoutMs?: number;
 }
 
 /**
  * Read configuration from a given env-reader. Allows tests to inject
  * a custom env without polluting the parent process. Same env-var names
  * as the Python mock.
+ *
+ * If LLM_BASE_URL is set (default: https://agw.k0s.io), the provider will
+ * call a real OpenAI-compatible LLM for P1 conversation_turn turns. The
+ * test harness can pass an empty/undefined llm block to disable this and
+ * keep the original echo behavior.
  */
 export function readConfig(
   envReader: (n: string, f?: string) => string | undefined = (n, f) => env(n, f),
 ): ProviderConfig {
-  return {
+  const baseUrl = envReader('LLM_BASE_URL') ?? 'https://agw.k0s.io';
+  const cfg: ProviderConfig = {
     requestSecret: loadSecret(envReader, 'MOCK_REQUEST_SECRET'),
     callbackSecret: loadSecret(envReader, 'MOCK_CALLBACK_SECRET', envReader('MOCK_REQUEST_SECRET')),
     keyId: envReader('MOCK_KEY_ID') ?? '',
@@ -218,6 +241,19 @@ export function readConfig(
     agentName: envReader('MOCK_AGENT_NAME') ?? 'finch-async-mock-ts',
     debugSign: envReader('DEBUG_SIGN') === '1',
   };
+  // Enable LLM by default — Finch providers are expected to be real Agents.
+  // The test harness overrides this with a `llm: undefined` config.
+  const apiKey = envReader('LLM_API_KEY') ?? '-';
+  const model = envReader('LLM_MODEL') ?? 'MiniMax-M3';
+  cfg.llm = {
+    baseUrl,
+    apiKey,
+    model,
+    systemPrompt: envReader('LLM_SYSTEM_PROMPT') ?? 'You are a helpful agent. Be concise.',
+    maxTokens: parseInt(envReader('LLM_MAX_TOKENS') ?? '1024', 10),
+    timeoutMs: parseInt(envReader('LLM_TIMEOUT_MS') ?? '30000', 10),
+  };
+  return cfg;
 }
 
 // ============================================================
@@ -435,6 +471,93 @@ class VerificationRejection extends Error {
 }
 
 // ============================================================
+// LLM client (OpenAI-compatible chat completions)
+// ============================================================
+
+class LlmError extends Error {
+  constructor(public code: string, message: string) {
+    super(message);
+  }
+}
+
+interface LlmChatResponse {
+  choices?: Array<{
+    message?: { role?: string; content?: string | null };
+    finish_reason?: string;
+  }>;
+  error?: { code?: string; message?: string; type?: string };
+}
+
+async function callLlm(llm: LlmConfig, userText: string): Promise<string> {
+  const baseUrl = llm.baseUrl.replace(/\/+$/, '');
+  const url = `${baseUrl}/v1/chat/completions`;
+  const body = JSON.stringify({
+    model: llm.model,
+    messages: [
+      ...(llm.systemPrompt ? [{ role: 'system', content: llm.systemPrompt }] : []),
+      { role: 'user', content: userText },
+    ],
+    max_tokens: llm.maxTokens ?? 1024,
+  });
+
+  const timeoutMs = llm.timeoutMs ?? 30000;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Content-Length': String(Buffer.byteLength(body)),
+  };
+  if (llm.apiKey) headers['Authorization'] = `Bearer ${llm.apiKey}`;
+
+  const raw = await new Promise<Buffer>((resolve, reject) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new LlmError('llm_bad_url', `invalid baseUrl: ${llm.baseUrl}`));
+      return;
+    }
+    const req = httpRequest(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: 'POST',
+        headers,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+      },
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new LlmError('llm_timeout', `request timed out after ${timeoutMs}ms`));
+    });
+    req.on('error', (e) => reject(new LlmError('llm_network', e.message)));
+    req.write(body);
+    req.end();
+  });
+
+  let parsedJson: LlmChatResponse;
+  try {
+    parsedJson = JSON.parse(raw.toString('utf8')) as LlmChatResponse;
+  } catch {
+    throw new LlmError('llm_bad_response', `non-JSON response: ${raw.toString('utf8').slice(0, 200)}`);
+  }
+  if (parsedJson.error) {
+    throw new LlmError(
+      parsedJson.error.code ?? 'llm_error',
+      parsedJson.error.message ?? 'unknown upstream error',
+    );
+  }
+  const text = parsedJson.choices?.[0]?.message?.content;
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new LlmError('llm_empty', 'LLM returned no text content');
+  }
+  return text;
+}
+
+// ============================================================
 // Handlers
 // ============================================================
 
@@ -492,7 +615,8 @@ async function handleInvoke(
   }
 
   if (mode === 'conversation_turn') {
-    // P1 — synchronous echo of the latest visible user text.
+    // P1 — synchronous. If an LLM backend is configured, call it; otherwise
+    // fall back to the deterministic echo behavior used by the test harness.
     const messages = payload.conversation?.messages ?? [];
     let visible = '';
     if (messages.length > 0) {
@@ -503,6 +627,41 @@ async function handleInvoke(
         }
       }
     }
+    // Also pick up the latest standalone input.content for the current turn.
+    const inputParts = payload.input?.content ?? [];
+    for (const part of inputParts) {
+      if (part.type === 'text' && part.text) visible = part.text;
+    }
+
+    if (config.llm) {
+      try {
+        const answer = await callLlm(config.llm, visible);
+        const completed: CompletedResponse = {
+          protocol_version: '2.0',
+          invocation_id: invocationId,
+          status: 'completed',
+          message: {
+            role: 'agent',
+            content: [{ type: 'text', text: answer }],
+          },
+          artifacts: [],
+          completed_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        };
+        writeSignedTo(res, req, 200, completed);
+      } catch (err) {
+        const code = (err as LlmError).code ?? 'llm_error';
+        const message = (err as Error).message ?? String(err);
+        writeSignedTo(res, req, 200, {
+          protocol_version: '2.0',
+          invocation_id: invocationId,
+          status: 'failed',
+          error: { code, message },
+        });
+      }
+      return;
+    }
+
+    // Fallback: deterministic echo (used by the test harness).
     const completed: CompletedResponse = {
       protocol_version: '2.0',
       invocation_id: invocationId,
