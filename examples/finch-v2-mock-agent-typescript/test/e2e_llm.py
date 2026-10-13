@@ -25,7 +25,7 @@ nonce = uuid.uuid4().hex
 canonical = f"POST\n/invoke\n{ts}\n{nonce}\n{hashlib.sha256(body).hexdigest()}"
 sig = "v1=" + hmac.new(key, canonical.encode(), hashlib.sha256).hexdigest()
 req = urllib.request.Request(
-    "http://127.0.0.1:28892/invoke",
+    "http://127.0.0.1:28894/invoke",
     data=body,
     method="POST",
     headers={

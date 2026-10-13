@@ -2,14 +2,19 @@
   "name": "finch-provider-ts",
   "version": "0.1.0",
   "private": true,
-  "description": "TypeScript reference implementation of a Finch finch_v2 Provider. Mirrors the official Python mock (deployed-python-mock/app.py).",
+  "description": "TypeScript reference implementation of a Finch finch_v2 Provider. Mirrors the official Python mock (deployed-python-mock/app.py) and extends it with a real LLM agent (pi-ai / pi-agent-core).",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
   },
+  "bin": {
+    "finch": "./src/cli.ts"
+  },
   "scripts": {
     "start": "tsx src/provider.ts",
+    "cli": "tsx src/cli.ts",
     "test": "tsx test/self_test.ts",
+    "test:all": "tsx test/self_test.ts && tsx src/history.test.ts && tsx test/agent_test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
@@ -18,6 +23,11 @@
     "typescript": "^5.6.0"
   },
   "dependencies": {
-    "openai": "^4.104.0"
+    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-agent-core": "^1.2.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
+    "@earendil-works/pi-durable": "^1.2.0",
+    "@earendil-works/pi-telemetry": "^1.2.0",
+    "@earendil-works/pi-tui": "^1.2.0"
   }
 }

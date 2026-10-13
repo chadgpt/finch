@@ -452,78 +452,42 @@ class VerificationRejection extends Error {
 }
 
 // ============================================================
-// LLM client (OpenAI-compatible chat completions)
+// LLM client
 // ============================================================
-// We use the official openai SDK with a custom baseURL. The SDK transparently
-// appends /chat/completions and handles auth, retries, JSON encoding/decoding,
-// streaming, and typed responses. Works against any OpenAI-compatible gateway
-// (agw.k0s.io, OpenRouter, Together, etc.).
+// All LLM calls go through the provider-agnostic abstraction in ./llm.ts.
+// That module picks between the OpenAI-compatible SDK and the Anthropic
+// SDK based on `cfg.baseUrl`, and maps SDK-specific errors to a small
+// set of provider-agnostic error classes (`LlmTimeoutError`,
+// `LlmNetworkError`, `LlmApiError`, plus the base `LlmError`).
 //
-// In Node: import from 'openai' (resolves via package.json + node_modules).
-// In Deno: the import map in deno.json maps 'openai' to 'npm:openai@^4'.
+// We keep a per-server singleton: readConfig() builds an LlmConfig from
+// env vars once, and every /invoke handler routes through the same
+// `LlmProvider` instance.
 
-import OpenAI from 'openai';
+import {
+  createLlmProvider,
+  LlmError,
+  type LlmProvider,
+} from './llm.ts';
+import { runAgentTurn } from './agent.ts';
 
-class LlmError extends Error {
-  constructor(public code: string, message: string) {
-    super(message);
-  }
-}
+let _llmProvider: LlmProvider | null = null;
+let _llmProviderConfig: LlmConfig | null = null;
 
-let _openaiClient: OpenAI | null = null;
-let _openaiClientConfig: LlmConfig | null = null;
-
-function openaiClient(llm: LlmConfig): OpenAI {
-  if (_openaiClient && _openaiClientConfig === llm) return _openaiClient;
-  // The SDK requires a non-empty apiKey; pass a sentinel when the gateway
-  // accepts the literal "-".
-  const apiKey = llm.apiKey || '-';
-  const baseURL = llm.baseUrl.replace(/\/+$/, '') + '/v1';
-  _openaiClient = new OpenAI({
-    apiKey,
-    baseURL,
-    timeout: llm.timeoutMs ?? 30000,
-    maxRetries: 0, // we surface errors to the caller; no silent retry
-  });
-  _openaiClientConfig = llm;
-  return _openaiClient;
-}
-
-async function callLlm(llm: LlmConfig, userText: string): Promise<string> {
-  const client = openaiClient(llm);
-  const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
-  if (llm.systemPrompt) messages.push({ role: 'system', content: llm.systemPrompt });
-  messages.push({ role: 'user', content: userText });
-
-  try {
-    const resp = await client.chat.completions.create({
-      model: llm.model,
-      messages,
-      max_tokens: llm.maxTokens ?? 1024,
-    });
-    const text = resp.choices[0]?.message?.content;
-    if (typeof text !== 'string' || text.length === 0) {
-      throw new LlmError('llm_empty', 'LLM returned no text content');
-    }
-    return text;
-  } catch (err: unknown) {
-    // The SDK throws an APIError with status / code / message.
-    if (err instanceof OpenAI.APIError) {
-      throw new LlmError(
-        `llm_${err.status}`,
-        `${err.code ?? 'api_error'}: ${err.message}`,
-      );
-    }
-    if (err instanceof OpenAI.APIConnectionError) {
-      throw new LlmError('llm_network', err.message);
-    }
-    if (err instanceof OpenAI.APIConnectionTimeoutError) {
-      throw new LlmError('llm_timeout', err.message);
-    }
-    if (err instanceof LlmError) throw err;
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new LlmError('llm_error', msg);
-  }
+function llmProvider(llm: LlmConfig): LlmProvider {
+  if (_llmProvider && _llmProviderConfig === llm) return _llmProvider;
+  // Materialize the optional fields with defaults before handing to pi-ai
+  const normalized = {
+    baseUrl: llm.baseUrl,
+    apiKey: llm.apiKey,
+    model: llm.model,
+    systemPrompt: llm.systemPrompt ?? 'You are a helpful agent. Be concise.',
+    maxTokens: llm.maxTokens ?? 1024,
+    timeoutMs: llm.timeoutMs ?? 30000,
+  };
+  _llmProvider = createLlmProvider(normalized);
+  _llmProviderConfig = llm;
+  return _llmProvider;
 }
 
 // ============================================================
@@ -604,22 +568,51 @@ async function handleInvoke(
 
     if (config.llm) {
       try {
-        const answer = await callLlm(config.llm, visible);
+        const provider = llmProvider(config.llm);
+        // Convert protocol conversation history → LLM ChatMessage[]
+        const historyMsgs: Array<{role:'user'|'assistant'|'system'; content:string}> = [];
+        for (const m of payload.conversation?.messages ?? []) {
+          const text = m.content
+            .filter((p) => p.type === 'text')
+            .map((p) => p.text)
+            .join('\n');
+          if (!text) continue;
+          // protocol uses 'agent' for assistant turns
+          historyMsgs.push({ role: m.role === 'agent' ? 'assistant' : 'user', content: text });
+        }
+        // Append the current user turn from input.content (visible takes
+        // priority since conversation may not include it).
+        if (visible && !historyMsgs.some((m) => m.content === visible)) {
+          historyMsgs.push({ role: 'user', content: visible });
+        }
+        const agentResp = await runAgentTurn(
+          {
+            llm: provider,
+            systemPrompt: config.llm.systemPrompt ?? 'You are a helpful agent. Be concise.',
+            model: config.llm.model,
+            maxTokens: config.llm.maxTokens ?? 1024,
+          },
+          historyMsgs,
+          visible,
+        );
+        if (!agentResp.text) {
+          throw new LlmError('llm_empty', 'LLM returned no text content');
+        }
         const completed: CompletedResponse = {
           protocol_version: '2.0',
           invocation_id: invocationId,
           status: 'completed',
           message: {
             role: 'agent',
-            content: [{ type: 'text', text: answer }],
+            content: [{ type: 'text', text: agentResp.text }],
           },
           artifacts: [],
           completed_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
         };
         writeSignedTo(res, req, 200, completed);
       } catch (err) {
-        const code = (err as LlmError).code ?? 'llm_error';
-        const message = (err as Error).message ?? String(err);
+        const code = err instanceof LlmError ? err.code : 'llm_error';
+        const message = err instanceof Error ? err.message : String(err);
         writeSignedTo(res, req, 200, {
           protocol_version: '2.0',
           invocation_id: invocationId,

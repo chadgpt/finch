@@ -40,6 +40,30 @@ export type TaskStatus =
   | 'canceled'
   | 'expired';
 
+/**
+ * One tool call in an assistant turn. Mirrors the OpenAI chat-completions
+ * `tool_calls[i]` shape. Persisted to SQLite as a JSON string in the
+ * `tool_calls` column.
+ */
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+/** A row in the `messages` table. */
+export interface MessageRow {
+  id: number;
+  task_id: string;
+  seq: number;
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls: string | null; // JSON-encoded ToolCall[]; null if none
+  tool_call_id: string | null;
+  name: string | null;
+  created_at: number;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
   merchant_task_id TEXT PRIMARY KEY,
@@ -59,8 +83,21 @@ CREATE TABLE IF NOT EXISTS nonces (
   nonce   TEXT PRIMARY KEY,
   seen_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS messages (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id       TEXT    NOT NULL,
+  seq           INTEGER NOT NULL,         -- 0, 1, 2, ... per task
+  role          TEXT    NOT NULL,         -- user | assistant | tool
+  content       TEXT    NOT NULL,
+  tool_calls    TEXT,                     -- JSON array of ToolCall, NULL if none
+  tool_call_id  TEXT,                     -- when role='tool', the call id this responds to
+  name          TEXT,                     -- when role='tool', the function name
+  created_at    REAL    NOT NULL,
+  UNIQUE(task_id, seq)
+);
 CREATE INDEX IF NOT EXISTS idx_nonces_seen_at ON nonces(seen_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, seq);
 `;
 
 export class Store {
@@ -73,6 +110,9 @@ export class Store {
   private readonly insertNonceStmt;
   private readonly countNoncesStmt;
   private readonly deleteOldNoncesStmt;
+  private readonly appendMessageStmt;
+  private readonly nextMessageSeqStmt;
+  private readonly getHistoryStmt;
 
   constructor(dbPath: string) {
     // Ensure parent dir exists
@@ -109,6 +149,21 @@ export class Store {
     this.insertNonceStmt = this.db.prepare('INSERT OR IGNORE INTO nonces (nonce, seen_at) VALUES (?, ?)');
     this.countNoncesStmt = this.db.prepare('SELECT COUNT(*) AS c FROM nonces');
     this.deleteOldNoncesStmt = this.db.prepare('DELETE FROM nonces WHERE seen_at < ?');
+
+    // Messages: appendMessage uses INSERT OR ROLLBACK so a UNIQUE(task_id, seq)
+    // collision surfaces as a SqliteError rather than silently replacing.
+    // The store-level try/catch translates that into a friendlier error.
+    this.appendMessageStmt = this.db.prepare(`
+      INSERT OR ROLLBACK INTO messages
+        (task_id, seq, role, content, tool_calls, tool_call_id, name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.nextMessageSeqStmt = this.db.prepare(
+      'SELECT COALESCE(MAX(seq) + 1, 0) AS s FROM messages WHERE task_id = ?',
+    );
+    this.getHistoryStmt = this.db.prepare(
+      'SELECT * FROM messages WHERE task_id = ? ORDER BY seq ASC',
+    );
   }
 
   // --- Tasks ---
@@ -200,6 +255,92 @@ export class Store {
     return true;
   }
 
+  // --- Messages (multi-turn conversation history) ---
+
+  /**
+   * Append a message to a task's history and return its assigned seq.
+   * If `seq` is omitted, the next free seq for the task is used (max+1).
+   *
+   * The seq must be unique per (task_id, seq) — passing a colliding seq
+   * throws a `MessageSeqConflictError` instead of silently replacing. The
+   * caller can choose to use `appendMessage(..., { seq })` to write a
+   * specific slot.
+   */
+  appendMessage(input: {
+    task_id: string;
+    role: 'user' | 'assistant' | 'tool';
+    content: string;
+    tool_calls?: ToolCall[];
+    tool_call_id?: string;
+    name?: string;
+    seq?: number;
+    created_at?: number;
+  }): number {
+    const opts = input as {
+      task_id: string;
+      role: 'user' | 'assistant' | 'tool';
+      content: string;
+      tool_calls?: ToolCall[];
+      tool_call_id?: string;
+      name?: string;
+      seq?: number;
+      created_at?: number;
+    };
+    const seq =
+      typeof opts.seq === 'number'
+        ? opts.seq
+        : (this.nextMessageSeqStmt.get(opts.task_id) as { s: number }).s;
+    const toolCallsJson =
+      opts.tool_calls && opts.tool_calls.length > 0
+        ? JSON.stringify(opts.tool_calls)
+        : null;
+    try {
+      this.appendMessageStmt.run(
+        opts.task_id,
+        seq,
+        opts.role,
+        opts.content,
+        toolCallsJson,
+        opts.tool_call_id ?? null,
+        opts.name ?? null,
+        opts.created_at ?? Date.now() / 1000,
+      );
+    } catch (err) {
+      if (isSeqConflict(err)) {
+        throw new MessageSeqConflictError(
+          opts.task_id,
+          seq,
+          `message seq ${seq} already exists for task ${opts.task_id}`,
+        );
+      }
+      throw err;
+    }
+    return seq;
+  }
+
+  /**
+   * Read all messages for a task, ordered by seq ASC. tool_calls is parsed
+   * back to a `ToolCall[]` (null if the original message had none).
+   */
+  getHistory(taskId: string): Array<{
+    seq: number;
+    role: 'user' | 'assistant' | 'tool';
+    content: string;
+    tool_calls: ToolCall[] | null;
+    tool_call_id: string | null;
+    name: string | null;
+  }> {
+    const rows = this.getHistoryStmt.all(taskId) as unknown as MessageRow[];
+    return rows.map((r) => ({
+      seq: r.seq,
+      role: r.role,
+      content: r.content,
+      tool_calls: r.tool_calls ? (JSON.parse(r.tool_calls) as ToolCall[]) : null,
+      tool_call_id: r.tool_call_id,
+      name: r.name,
+    }));
+  }
+
   // --- Stats / shutdown ---
 
   taskCount(): number {
@@ -221,3 +362,40 @@ export class Store {
 export const DEFAULT_DB_PATH = path.resolve(
   process.env.FINCH_DB_PATH ?? './finch-provider.db',
 );
+
+/**
+ * Thrown by `Store.appendMessage` when a (task_id, seq) pair already exists.
+ * Carries the offending ids so callers can decide whether to retry with a
+ * higher seq or surface the failure.
+ */
+export class MessageSeqConflictError extends Error {
+  readonly taskId: string;
+  readonly seq: number;
+  constructor(taskId: string, seq: number, message: string) {
+    super(message);
+    this.name = 'MessageSeqConflictError';
+    this.taskId = taskId;
+    this.seq = seq;
+  }
+}
+
+/**
+ * Best-effort check whether a thrown error from `node:sqlite` is a UNIQUE
+ * constraint violation on the messages table.
+ *
+ * `node:sqlite` wraps every SQLite error in a plain `Error` with:
+ *   - `code:    'ERR_SQLITE_ERROR'`
+ *   - `errcode: 2067`           (= SQLITE_CONSTRAINT_UNIQUE extended code)
+ *   - `errstr:  'constraint failed'`
+ *   - `message: 'UNIQUE constraint failed: messages.task_id, messages.seq'`
+ *
+ * Since `code` is identical for any SQLite error, we additionally require
+ * the message to mention `messages.` so we don't misclassify a UNIQUE
+ * collision on a different table.
+ */
+function isSeqConflict(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: string; errcode?: number; message?: string };
+  if (e.code !== 'ERR_SQLITE_ERROR') return false;
+  return typeof e.message === 'string' && /messages\./.test(e.message);
+}
