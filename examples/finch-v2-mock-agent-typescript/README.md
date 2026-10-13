@@ -26,6 +26,40 @@ npm start            # starts provider
 npm run typecheck    # tsc --noEmit
 ```
 
+### Expose it on a public HTTPS URL (for contract test / live demo)
+
+The mock binds to `127.0.0.1`, so Finch cannot reach it directly. A
+zero-install public tunnel can be added with one command in a second
+terminal:
+
+```bash
+# terminal 1
+deno task start
+
+# terminal 2
+./scripts/tunnel.sh
+# -> prints e.g. https://d384eb40cc3a4e.lhr.life
+# -> Ctrl-C to stop
+```
+
+`scripts/tunnel.sh` uses `localhost.run` over plain SSH — no extra
+software, no account, no signup. The URL is **random per run**; for a
+stable URL, register a custom domain at
+<https://admin.localhost.run/> and add your SSH public key (see
+<https://localhost.run/docs/forever-free/>).
+
+Then point Finch at the public URL:
+
+| Setting | Value |
+|---|---|
+| `wireProtocol` | `finch_v2` |
+| `invocationUrl` | `https://<random>.lhr.life/invoke` |
+| `healthUrl`      | `https://<random>.lhr.life/health` |
+| `taskUrl`        | (omit for P1 only) |
+
+Verified end-to-end: signed `GET /health` over the tunnel returns
+`{"status":"ready",...}` with valid `X-Agent-*` headers (2026-10-13).
+
 ## What this is
 
 - **1:1 mirror of the official Python mock** — every protocol behavior corresponds

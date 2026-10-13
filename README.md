@@ -43,6 +43,38 @@ python3 deployed-python-mock/self_test.py
 MOCK_REQUEST_SECRET=... MOCK_KEY_ID=... python3 deployed-python-mock/app.py
 ```
 
+### Expose the mock on a public HTTPS URL
+
+The mock binds to `127.0.0.1`, so the Finch contract test cannot reach it directly.
+The TypeScript example ships a zero-install tunnel script:
+
+```bash
+# terminal 1
+cd examples/finch-v2-mock-agent-typescript
+deno task start
+
+# terminal 2
+./scripts/tunnel.sh
+# -> prints e.g. https://d384eb40cc3a4e.lhr.life
+# -> Ctrl-C to stop
+```
+
+Uses `localhost.run` over plain SSH — no extra software, no account.
+The URL is **random per run**; for a stable URL, register a custom domain at
+<https://admin.localhost.run/> and add your SSH public key (see
+<https://localhost.run/docs/forever-free/>).
+
+Then in the Finch Provider workspace:
+
+| Setting | Value |
+|---|---|
+| `wireProtocol` | `finch_v2` |
+| `invocationUrl` | `https://<random>.lhr.life/invoke` |
+| `healthUrl` | `https://<random>.lhr.life/health` |
+
+End-to-end verified on 2026-10-13: a signed `GET /health` over the tunnel returns
+`{"status":"ready",...}` with valid `X-Agent-*` headers.
+
 ## Reference research
 
 External analyses (not part of this repo, but built on the same sources):
@@ -58,6 +90,7 @@ External analyses (not part of this repo, but built on the same sources):
 | `docs/README.md` (43 KB) | 2026-10-04 | `curl https://www.finchtech.ai/market/agents/docs` |
 | `examples/finch-v2-mock-agent/` (25 KB) | 2026-10-04 | `curl https://www.finchtech.ai/downloads/finch-v2-mock-agent.zip`, SHA-256 verified against SOURCE.md |
 | `examples/finch-v2-mock-agent-typescript/` (29 KB) | 2026-10-13 | Ported from the Python mock; verified 6/6 tests pass in Deno 2.9.7 and Node 22.19 |
+| `examples/finch-v2-mock-agent-typescript/scripts/tunnel.sh` | 2026-10-13 | localhost.run SSH tunnel, end-to-end verified: signed GET /health over the tunnel returns 200 + valid X-Agent-* headers |
 
 ## License
 
