@@ -28,9 +28,38 @@ npm run typecheck    # tsc --noEmit
 
 ### Expose it on a public HTTPS URL (for contract test / live demo)
 
-The mock binds to `127.0.0.1`, so Finch cannot reach it directly. A
-zero-install public tunnel can be added with one command in a second
-terminal:
+The mock binds to `127.0.0.1`, so Finch cannot reach it directly.
+Two zero-install tunnel options are included:
+
+#### Option A: ufo (recommended, supports persistent subdomains)
+
+[ufo](https://github.com/webteleport/ufo) is an open-source
+WebTransport-based tunnel (MIT, by the webteleport team). `ufo pub`
+allocates a public HTTPS URL on the configured RELAY server and
+forwards to your local port.
+
+```bash
+# install ufo (puts binary in ~/.k0s/bin)
+curl -sL https://k0s.io/install.sh | bash
+export PATH="$HOME/.k0s/bin:$PATH"
+
+# terminal 1
+deno task start
+
+# terminal 2
+# Default: random subdomain on the public ufo relay.
+./scripts/tunnel-ufo.sh
+# -> prints e.g. https://abc123.ufo.k0s.io
+
+# Persistent subdomain: set RELAY to your own ufo relay that supports persistence.
+RELAY=https://ufoufo.k0s.io/finch-dev?persist=1 ./scripts/tunnel-ufo.sh
+# -> prints a stable URL that survives restarts (depends on relay config)
+```
+
+#### Option B: localhost.run (SSH-only fallback, random subdomain)
+
+If ufo doesn't fit (e.g., sandboxed environments), use the SSH-only
+fallback that requires zero software install:
 
 ```bash
 # terminal 1
@@ -39,26 +68,24 @@ deno task start
 # terminal 2
 ./scripts/tunnel.sh
 # -> prints e.g. https://d384eb40cc3a4e.lhr.life
-# -> Ctrl-C to stop
 ```
 
-`scripts/tunnel.sh` uses `localhost.run` over plain SSH — no extra
-software, no account, no signup. The URL is **random per run**; for a
-stable URL, register a custom domain at
+URL is **random per run**; for a stable URL, register a custom domain at
 <https://admin.localhost.run/> and add your SSH public key (see
 <https://localhost.run/docs/forever-free/>).
 
-Then point Finch at the public URL:
+#### Point Finch at the public URL
 
 | Setting | Value |
 |---|---|
 | `wireProtocol` | `finch_v2` |
-| `invocationUrl` | `https://<random>.lhr.life/invoke` |
-| `healthUrl`      | `https://<random>.lhr.life/health` |
+| `invocationUrl` | `https://<public-host>/invoke` |
+| `healthUrl`      | `https://<public-host>/health` |
 | `taskUrl`        | (omit for P1 only) |
 
-Verified end-to-end: signed `GET /health` over the tunnel returns
-`{"status":"ready",...}` with valid `X-Agent-*` headers (2026-10-13).
+End-to-end verified on 2026-10-13: a signed `GET /health` over a
+public tunnel returns `{"status":"ready",...}` with valid `X-Agent-*`
+headers.
 
 ## What this is
 
