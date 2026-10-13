@@ -1,0 +1,15 @@
+{
+  "listen": { "hostname": "127.0.0.1", "port": 28892 },
+  "tls": {
+    "certificatePath": "/ABSOLUTE/PATH/server-certificate.pem",
+    "privateKeyPath": "/ABSOLUTE/PATH/server-private-key.pem"
+  },
+  "credentials": {
+    "keyId": "local-fixture-key",
+    "requestSecret": "REPLACE_WITH_LOCAL_FIXTURE_REQUEST_KEY",
+    "callbackSecret": "REPLACE_WITH_LOCAL_FIXTURE_CALLBACK_KEY"
+  },
+  "wireProtocol": "finch_v2",
+  "scenario": "success",
+  "allowedOutboundOrigins": []
+}

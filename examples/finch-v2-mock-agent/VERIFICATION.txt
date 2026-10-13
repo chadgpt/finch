@@ -1,0 +1,19 @@
+Validation performed on 2026-09-18
+
+Deployed Python source hash verified against the VM: PASS
+Python self_test.py: PASS
+  Signed health response and invalid-signature rejection
+  P1 synchronous completed text response
+  P2 contract test: accepted, working, completed
+  P2 supplemental input: input_required, accepted input, completed answer
+  P3 artifact upload to a loopback test sink and completed artifact metadata
+Node merchant-server.mjs syntax: PASS
+Repository Node fixture integration suites: 21 tests passed across 2 files
+Credential/private-key pattern scan of package: no matches
+
+No new calls to Finch APIs or third-party merchant endpoints were made for smoke tests.
+No real P3 Finch artifact receipt or online publication was performed.
+No live deployment credentials, wallet keys, or .env files were copied.
+
+The initial Node test command selected the unit-test configuration and found no tests.
+The corrected command used vitest.integration.config.ts and passed all 21 tests.
