@@ -14,7 +14,7 @@ multi-turn history in built-in `node:sqlite`.
 ### Run with Deno (no install)
 
 ```bash
-deno task test:all   # self_test + history_test + agent_test
+deno task test:all   # self_test 6/6 + history_test 8/8 + diag_test 6/6 + agent_test 4/4
 deno task start      # starts HTTP provider on 127.0.0.1:28891
 deno task cli ask    # interactive REPL against the agent
 deno task check      # type-check all source files
@@ -22,7 +22,12 @@ deno task check      # type-check all source files
 
 That's it. Deno is the only tool you need.
 
-### Run with Node 22+
+> **Deno caveat:** `test/agent_test.ts` hits a real LLM (pi-ai → gateway) and
+> needs `--allow-sys` for pi-ai's user-agent helper. The `test:all` task
+> already includes it. Also, if you run on a filesystem where libsqlite's
+> FFI binding is unhappy (NFS mounts, some FUSE setups), set
+> `FINCH_DB_PATH=/tmp/whatever.db` — the Store class writes wherever you
+> point it.
 
 ```bash
 npm install          # only devDeps + @earendil-works/pi-* runtime deps
