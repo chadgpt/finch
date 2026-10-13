@@ -1,7 +1,11 @@
 # Finch Provider (TypeScript)
 
-TypeScript reference implementation of a Finch `finch_v2` Provider, mirroring the
-official Python mock at `deployed-python-mock/app.py`.
+TypeScript reference implementation of a Finch `finch_v2` Provider. Mirrors the
+official Python mock at `../finch-v2-mock-agent/deployed-python-mock/app.py`,
+extends it with a **real LLM agent** built on the
+[earendil-works/pi](https://www.npmjs.com/org/earendil-works) stack
+(`@earendil-works/pi-ai` + `pi-agent-core` + `pi-tui`), and persists
+multi-turn history in built-in `node:sqlite`.
 
 **Runs in both Node 22+ and Deno 2.x** with no code changes.
 
@@ -10,9 +14,10 @@ official Python mock at `deployed-python-mock/app.py`.
 ### Run with Deno (no install)
 
 ```bash
-deno task test       # 6/6 PASS, no Finch account, no external network
-deno task start      # starts provider on 127.0.0.1:28891
-deno task check      # type-check both files
+deno task test:all   # self_test + history_test + agent_test
+deno task start      # starts HTTP provider on 127.0.0.1:28891
+deno task cli ask    # interactive REPL against the agent
+deno task check      # type-check all source files
 ```
 
 That's it. Deno is the only tool you need.
@@ -20,27 +25,36 @@ That's it. Deno is the only tool you need.
 ### Run with Node 22+
 
 ```bash
-npm install          # only devDeps: tsx, typescript, @types/node
-npm test             # 6/6 PASS
-npm start            # starts provider
+npm install          # only devDeps + @earendil-works/pi-* runtime deps
+npm run test:all     # self_test (6) + history_test (8) + agent_test (4)
+npm start            # starts HTTP provider
+npx tsx src/cli.ts ask   # interactive REPL
 npm run typecheck    # tsc --noEmit
 ```
 
 ## What this is
 
-- **1:1 mirror of the official Python mock** — every protocol behavior corresponds
-  to a block in the Python source.
-- **P1 sync + P2 async + P3 generation** with deterministic `merchant_task_id`
-  and HMAC-SHA256 signed responses.
+- **1:1 mirror of the official Python mock** — every protocol behavior
+  corresponds to a block in the Python source (HMAC, P1 sync, P2 async,
+  P3 generation, contract test, signed outbound).
+- **pi-native LLM layer** — the P1 conversation_turn path drives a real
+  agent (`src/agent.ts`) built on `@earendil-works/pi-ai` for unified
+  OpenAI / Anthropic / Google / Bedrock model support. Tool-calling,
+  streaming, multi-turn, and (via `pi-tui`) interactive TUI are first-class.
+- **Three subcommands** via `npx tsx src/cli.ts`:
+  - `start` — HTTP provider
+  - `ask` — interactive REPL or `--prompt "..."` one-shot
+  - (TUI components are wired but the REPL uses a minimal spinner; swap
+    in `@earendil-works/pi-tui` for the full chat experience)
 - **Strict TypeScript** (`noUncheckedIndexedAccess`, strict mode).
-- **No runtime dependencies** beyond `openai` SDK — uses Node 22+ / Deno 2.x
-  built-ins (`node:crypto`, `node:http`, `node:net`, `node:process`,
-  `node:sqlite`) plus the official `openai@^4` package (mapped via `npm:` in
-  Deno, installed normally in Node).
 - **State persistence** via built-in `node:sqlite` — no Redis, no native
   modules, no external DB. Same DB file works across server restarts;
   re-sending the same `Idempotency-Key` returns the same `merchant_task_id`.
-- **Self-contained test** — no Finch account, no external network.
+- **Three test suites**:
+  - `test/self_test.ts` — 6/6 protocol-level checks (no LLM, no network)
+  - `src/history.test.ts` — 8/8 store + LLM-history conversion
+  - `test/agent_test.ts` — 4/4 end-to-end against a real LLM
+    (single-turn, multi-turn, tool use, streaming)
 
 ## What this is NOT
 
@@ -49,176 +63,128 @@ npm run typecheck    # tsc --noEmit
   See "Production checklist" below.
 - **Not affiliated with Finch.** This is a community reference.
 
-## Files
+## Architecture
 
-| File | Purpose |
+```
+┌────────────────────────────────────────────────────────────────┐
+│  HTTP server (src/provider.ts)                                 │
+│                                                                │
+│   POST /invoke    ┌── P1 sync  ──┐                             │
+│                   │  → agent.ts  │                             │
+│                   └── P2 async ──┤  (P2 state machine in       │
+│                   └── P3 gen  ───┘   store / SQLite)            │
+│   POST /tasks/{id}              → returns P2 status            │
+│   GET  /health                                                   │
+└────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌────────────────────────────────────────────────────────────────┐
+│  Agent core (src/agent.ts)                                     │
+│                                                                │
+│   runAgentTurn({ llm, systemPrompt, model, maxTokens,          │
+│                  extraTools, onEvent })                         │
+│     ├── builds ChatMessage[] history                           │
+│     ├── loops up to maxToolSteps (default 5):                  │
+│     │     1. llm.complete(req)                                 │
+│     │     2. if tool_calls → execute each, append tool result  │
+│     │     3. else → return final text                          │
+│     └── returns { text, toolCalls, usage, steps }              │
+└────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌────────────────────────────────────────────────────────────────┐
+│  LLM abstraction (src/llm.ts)                                 │
+│                                                                │
+│   LlmProvider interface (name, complete, stream)                │
+│     └── PiAiProvider wraps @earendil-works/pi-ai                │
+│         ├── createProvider({ auth: envApiKeyAuth(...) })       │
+│         ├── openAICompletionsApi() OR anthropicMessagesApi()   │
+│         └── routes by baseUrl to OpenAI or Anthropic format    │
+│                                                                │
+│   BUILTIN_TOOLS:                                                │
+│     ├── get_current_time (real tool)                            │
+│     └── decide_response (signal tool for P2 async)              │
+└────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+                LLM gateway (e.g. https://agw.k0s.io/v1)
+```
+
+## Configuration
+
+All configuration is via environment variables — see `.env.example`:
+
+| Var | Default | Description |
+|---|---|---|
+| `MOCK_REQUEST_SECRET` | *(required)* | Base64URL of 32 raw HMAC bytes (Finch request side) |
+| `MOCK_CALLBACK_SECRET` | *(same as request)* | Base64URL of 32 raw HMAC bytes (Finch callback side) |
+| `MOCK_KEY_ID` | `finch.agenton.<uuid>` | Your provider key id from the Finch workspace |
+| `MOCK_PORT` | `28891` | HTTP listen port |
+| `FINCH_DB_PATH` | `./finch-provider.db` | SQLite file path (auto-migrated) |
+| `LLM_BASE_URL` | `https://agw.k0s.io/v1` | OpenAI-compatible gateway. Use `…/v1/messages` for Anthropic format. |
+| `LLM_API_KEY` | `-` | API key for the gateway. `-` for unauth dev gateways. |
+| `LLM_MODEL` | `MiniMax-M3` | Model name registered on the gateway |
+| `LLM_SYSTEM_PROMPT` | `You are a helpful agent. Be concise.` | System prompt for P1 / REPL |
+| `LLM_MAX_TOKENS` | `1024` | Max output tokens per LLM call |
+| `LLM_TIMEOUT_MS` | `30000` | Per-call timeout |
+
+To run **without** an LLM (echo-only P1, deterministic P2/P3), set
+`LLM_BASE_URL=` to empty in the config or pass a config with `llm: undefined`
+to `startServer()` in your test harness.
+
+## Diagnosing integration: `GET /__diag`
+
+`self_test` proves the protocol is correct, but the only proof a real
+Finch platform is calling you is *them actually calling you*. The
+provider exposes a local diagnostic endpoint for exactly this:
+
+```bash
+curl http://127.0.0.1:28894/__diag | jq
+```
+
+Returns a JSON snapshot of:
+
+| Field | What it tells you |
 |---|---|
-| `src/provider.ts` | The HTTP server (P1/P2/P3 routes) + HMAC + state machine |
-| `src/db.ts` | SQLite-backed store (tasks + nonces) using `node:sqlite` |
-| `test/self_test.ts` | End-to-end test with ephemeral keys (in-process) |
-| `test/e2e_llm.py` | One-shot LLM probe script (sends a signed P1 turn) |
-| `deno.json` | Deno tasks: `start`, `test`, `check` |
-| `package.json` | Node devDeps + `openai` runtime dep |
-| `tsconfig.json` | Strict mode, target ES2022, ESM |
-| `.env.example` | Required env vars (placeholders only) |
-| `.gitignore` | Excludes `.env`, `node_modules/`, `*.db*` |
+| `total_requests` | Anything > 1 (after you've curled `/__diag` once) means the server has been hit. |
+| `verify_success` / `verify_failure.{reason}` | Counters per failure mode — `missing_header` vs `bad_signature` vs `skew` vs `replay` vs `empty_nonce`. After pointing a tunnel at this provider, watch this for spikes while you trigger a test invocation from the Finch workspace. |
+| `last_p2_poll_at` | The single most useful field for async tasks. Stays `null` until the platform GETs `/tasks/{id}` to poll your task. If you returned 202 for a P2 task and this is `null` 60s later, the platform isn't polling you. |
+| `last_invocation_id` | The most recent `invocation_id` parsed from the request body. Useful to correlate with a test you fired from the workspace. |
+| `last_platform_ts` | Wall-clock from the platform's `X-Platform-Timestamp`. Compare with `Date.now()` — large gaps mean clock skew (the protocol rejects >300s). |
+| `recent[].{ts,method,path,status,verify,invocation_id}` | The last 50 requests, newest first. Bounded ring buffer. |
+| `ever_called_from_remote` | `true` if anyone with a non-loopback address has ever hit the server. Stays `false` for purely local tests; flips on the first real platform call. |
 
-## Routes
+The endpoint has **no auth** — `127.0.0.1`-only by convention. Gate
+behind a network ACL or admin token before deploying publicly.
 
-| Method | Path | Purpose |
-|---|---|---|
-| `GET`  | `/health` | Signed health probe (empty body) |
-| `POST` | `/invoke` | P1 sync / P2 initial dispatch / P3 initial dispatch |
-| `GET`  | `/tasks/{merchant_task_id}` | Poll task snapshot |
-| `POST` | `/tasks/{merchant_task_id}/messages` | Supplemental user input |
-| `POST` | `/tasks/{merchant_task_id}/cancel` | Cancel task |
+There is a `test/diag_test.ts` that drives the snapshot end-to-end
+(6/6) to confirm the counters move correctly under each failure mode.
 
-All inbound requests must carry `X-Platform-Key-Id`, `X-Platform-Timestamp`,
-`X-Platform-Nonce`, `X-Platform-Signature`. All outbound responses carry the
-matching `X-Agent-*` headers, even on 4xx.
+## Why pi-ai + pi-agent-core?
 
-## HMAC canonical string
+`@earendil-works/pi-ai` unifies OpenAI / Anthropic / Google / Bedrock behind
+one `models.complete(model, ctx, opts)` call. The provider is auto-discovered
+from `baseUrl` (it includes `/v1/messages` or `anthropic` → Anthropic format,
+else OpenAI format). `@earendil-works/pi-agent-core` gives a stateful agent
+loop (we use a hand-written one in `src/agent.ts` because the protocol wants
+specific message shapes; pi-agent-core is still useful for
+`pi-coding-agent`-style setups and is included as a dependency).
 
-```
-METHOD
-PATH?QUERY
-TIMESTAMP
-NONCE
-SHA256(body)
-```
+## Production checklist
 
-`METHOD` is uppercased. `PATH?QUERY` preserves the exact request path and query
-string. The signature is `v1=` + hex `HMAC-SHA256(secret, canonical)`.
+- [ ] Send async callbacks (not implemented in the mock; use a worker queue)
+- [ ] Persist the DB to durable storage (the `node:sqlite` file is fine for a
+      single instance; use Postgres for HA)
+- [ ] Add request-level schema validation (zod / typebox) for the Finch v2
+      envelope — the Python mock validates by hand; for production prefer
+      generated types from the JSON Schema Finch publishes
+- [ ] Rate-limit `/invoke` (token bucket per merchant_task_id)
+- [ ] Rotate keys via the Finch workspace, not via env
 
-Secrets are 32 raw bytes, displayed as 43-character Base64URL (no padding) in
-the workspace. The runtime decodes them via `Buffer.from(s, 'base64url')`.
+## See also
 
-## Env vars (CLI usage)
-
-| Var | Required | Notes |
-|---|---|---|
-| `MOCK_REQUEST_SECRET` | yes | Base64URL encoding of 32 raw Request secret bytes |
-| `MOCK_CALLBACK_SECRET` | optional | Falls back to `MOCK_REQUEST_SECRET` if unset |
-| `MOCK_KEY_ID` | yes | `finch.agenton.<uuid>` from your workspace |
-| `MOCK_PORT` | optional | Default `28891` |
-| `MOCK_AGENT_NAME` | optional | Default `finch-async-mock-ts` |
-| `FINCH_DB_PATH` | optional | SQLite file path. Default `./finch-provider.db` |
-| `LLM_*` | optional | See "Talking to a real LLM" section below |
-
-## Talking to a real LLM
-
-The P1 `conversation_turn` branch calls an OpenAI-compatible gateway by
-default (`https://agw.k0s.io`, model `MiniMax-M3`). The integration uses
-the official [`openai`](https://www.npmjs.com/package/openai) SDK v4 — not
-a hand-rolled HTTP request.
-
-Quick verify:
-
-```bash
-# 1. Start the server
-deno task start          # or: npm start
-
-# 2. In another terminal, send a signed P1 turn
-MOCK_KEY_ID=... MOCK_REQUEST_SECRET=... python3 test/e2e_llm.py
-```
-
-You should see `text: '...HELLO'` in the response. End-to-end verified
-2026-10-13 with a real agw.k0s.io call.
-
-To switch to a different OpenAI-compatible gateway, just change
-`LLM_BASE_URL` and `LLM_MODEL`. To switch to Anthropic-style calls, swap
-the SDK in `src/provider.ts` (the env vars stay the same). To disable
-the LLM and use the deterministic echo fallback, leave `LLM_BASE_URL` empty.
-| `DEBUG_SIGN` | optional | Set to `1` to log signature-mismatch diagnostics on the server |
-
-### Loading env in Deno (no dotenv library needed)
-
-```bash
-deno run --allow-net --allow-env --env-file=.env src/provider.ts
-```
-
-Deno 1.43+ reads `.env` natively. No `dotenv` package required.
-
-### Loading env in Node
-
-```bash
-MOCK_REQUEST_SECRET=... MOCK_KEY_ID=... npm start
-# or use a wrapper like dotenv / direnv / systemd EnvironmentFile
-```
-
-## Using `startServer()` from your own code
-
-```typescript
-import { startServer, readConfig } from './src/provider.ts';
-
-// Option A: read env, then start (CLI pattern)
-const srv = startServer(readConfig());
-
-// Option B: build config inline (test pattern)
-const srv = startServer({
-  requestSecret: mySecret,           // 32-byte Buffer
-  callbackSecret: myCallbackSecret,  // 32-byte Buffer
-  keyId: 'finch.agenton.<uuid>',
-  port: 0,                            // 0 = pick a free port
-  agentName: 'my-agent',
-  debugSign: false,
-});
-// srv.port is the actual bound port
-// srv.close() to stop
-```
-
-## State persistence
-
-Tasks and nonces are stored in a local SQLite file at `FINCH_DB_PATH`
-(default `./finch-provider.db`). The schema is auto-migrated on first start:
-
-```sql
-CREATE TABLE tasks (
-  merchant_task_id TEXT PRIMARY KEY,
-  invocation_id    TEXT NOT NULL,
-  state            TEXT NOT NULL,        -- working | input_required | completed
-  sequence         INTEGER NOT NULL,
-  contract_test    INTEGER NOT NULL,
-  answer           TEXT,
-  ready_at         REAL NOT NULL,
-  completed        INTEGER NOT NULL,
-  question         TEXT NOT NULL,
-  mode             TEXT NOT NULL,
-  artifacts_json   TEXT NOT NULL,
-  created_at       REAL NOT NULL
-);
-CREATE TABLE nonces (
-  nonce   TEXT PRIMARY KEY,
-  seen_at REAL NOT NULL
-);
-```
-
-Uses the built-in `node:sqlite` module — no external DB driver, no native
-compilation, no Redis. Available in both Node 22.5+ and Deno 2.x. End-to-end
-verified that a server restart with the same `FINCH_DB_PATH` returns the
-same `merchant_task_id` for a replayed `Idempotency-Key` and a `completed`
-snapshot for tasks that have already advanced.
-
-For multi-process deployments, switch the store to a real RDBMS or Redis
-(see "Production checklist" — the `Store` class in `src/db.ts` is the only
-seam to swap).
-
-## Production checklist (from the official Python mock)
-
-Before going live:
-
-- [ ] Replace the local SQLite `Store` with a shared RDBMS or Redis if you run
-      multiple processes. Single-process: SQLite is enough.
-- [ ] Implement outbound callback delivery (POST to `callback.url` with the Callback secret).
-- [ ] Strict P3 upload: never fall back to `text/plain`; respect `allowed_media_types` exactly.
-- [ ] Add a real schema validator (Ajv in strict mode) for the full `finch_v2` envelope.
-- [ ] Enforce `limits.deadline_at`; reject overdue invocations before doing real work.
-- [ ] Add structured logging with `invocation_id`, `dispatch_id`, `merchant_task_id`, `credential revision`.
-- [ ] Validate the `output_contract.artifacts` against the `artifact_uploads` you actually consume.
-- [ ] Bind the verifier to a frozen `service_version_id` + `credential revision`; reject requests bound to other revisions.
-- [ ] Add a graceful cancel handler.
-
-## License
-
-Same as the official Python mock — Finch does not specify a license for the
-deployed source. Treat as reference-only; do not redistribute as your own.
+- `../finch-v2-mock-agent/` — the official Python reference (this TS port is
+  a 1:1 mirror, verified per-file in `VERIFICATION.md`)
+- `../finch-v2-mock-agent/SOURCE.md` — annotated walkthrough of the Python
+  mock
+- `../../../VERIFICATION.md` (in repo root) — drift-detection baseline

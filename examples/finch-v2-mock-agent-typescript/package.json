@@ -14,7 +14,7 @@
     "start": "tsx src/provider.ts",
     "cli": "tsx src/cli.ts",
     "test": "tsx test/self_test.ts",
-    "test:all": "tsx test/self_test.ts && tsx src/history.test.ts && tsx test/agent_test.ts",
+    "test:all": "tsx test/self_test.ts && tsx src/history.test.ts && tsx test/agent_test.ts && tsx test/diag_test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

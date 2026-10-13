@@ -42,6 +42,17 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import process from 'node:process';
 import { Store, type TaskRow } from './db.ts';
+import {
+  recordEvent,
+  recordP2Poll,
+  recordPlatformTs,
+  recordRequest,
+  recordVerifyFailure,
+  recordVerifySuccess,
+  recordInvocationId,
+  setLastSeenInvocationId,
+  getMetrics,
+} from './metrics.ts';
 
 // Note: `URL` is a global in both Node 22+ and Deno 2.x, so we use the global
 // form here for cross-runtime compatibility.
@@ -394,6 +405,7 @@ async function verifyPlatform(req: IncomingMessage, body: Buffer): Promise<boole
   const nonce = req.headers['x-platform-nonce'];
   const sig = req.headers['x-platform-signature'];
   if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') {
+    recordVerifyFailure('missing_header');
     if (config.debugSign) {
       console.error('verify: missing or wrong-type headers', { ts, nonce, sig: typeof sig });
     }
@@ -401,20 +413,24 @@ async function verifyPlatform(req: IncomingMessage, body: Buffer): Promise<boole
   }
   const tsNum = parseInt(ts, 10);
   if (!Number.isFinite(tsNum)) {
+    recordVerifyFailure('bad_timestamp');
     if (config.debugSign) console.error('verify: bad ts', ts);
     return false;
   }
   const now = Math.floor(Date.now() / 1000);
   if (Math.abs(now - tsNum) > SKEW_TOLERANCE_SEC) {
+    recordVerifyFailure('skew');
     if (config.debugSign) console.error('verify: skew', { now, tsNum, diff: now - tsNum });
     return false;
   }
   if (!nonce) {
+    recordVerifyFailure('empty_nonce');
     if (config.debugSign) console.error('verify: empty nonce');
     return false;
   }
   // Replay check (must happen BEFORE signature check; mocked Python does it inline)
   if (!consumeNonce(nonce)) {
+    recordVerifyFailure('replay');
     // Replay — return 409 with signed body. We need res from caller, so this is
     // signalled by returning 'replay' and letting the handler respond.
     throw new VerificationRejection('nonce_replay', 409);
@@ -428,6 +444,7 @@ async function verifyPlatform(req: IncomingMessage, body: Buffer): Promise<boole
     body,
   );
   if (!safeEq(expected, sig)) {
+    recordVerifyFailure('bad_signature');
     if (config.debugSign) {
       console.error('verify: sig mismatch', {
         method: req.method,
@@ -442,6 +459,8 @@ async function verifyPlatform(req: IncomingMessage, body: Buffer): Promise<boole
     }
     return false;
   }
+  recordVerifySuccess();
+  recordPlatformTs(tsNum);
   return true;
 }
 
@@ -541,6 +560,8 @@ async function handleInvoke(
     writeSignedTo(res, req, 422, { code: 'invocation_invalid' });
     return;
   }
+  recordInvocationId(invocationId);
+  setLastSeenInvocationId(invocationId);
   const mode = payload.interaction_mode;
   if (mode !== 'conversation_turn' && mode !== 'task' && mode !== 'generation') {
     writeSignedTo(res, req, 422, { code: 'interaction_mode_invalid' });
@@ -962,6 +983,28 @@ async function handleCancel(
 // Router
 // ============================================================
 
+/**
+ * `GET /__diag` — local diagnostic endpoint (no HMAC).
+ *
+ * Returns a JSON snapshot of process metrics. See `src/metrics.ts` for the
+ * full schema. Designed so a developer can curl it after pointing a
+ * tunnel at their provider and immediately see whether the platform
+ * has called them yet.
+ *
+ * SECURITY: no auth. In production, gate this behind a network ACL or
+ * an admin token — the response leaks recent request paths and
+ * invocation_ids.
+ */
+function handleDiag(res: ServerResponse, _req: IncomingMessage): void {
+  const snap = getMetrics();
+  const body = JSON.stringify(snap, null, 2);
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+}
+
 function buildServer(): import('node:http').Server {
   return createServer(async (req, res) => {
   const method = req.method ?? 'GET';
@@ -972,14 +1015,48 @@ function buildServer(): import('node:http').Server {
       return '/';
     }
   })();
+  const remote = (req.socket.remoteAddress ?? 'unknown').replace(/^::ffff:/, '');
+
+  // Track every request that reaches the server. This is the most reliable
+  // signal that a remote caller (the platform) is hitting us.
+  recordRequest(method, pathOnly, remote);
+  // Each request starts with no associated invocation_id; the body
+  // parser will fill it in via setLastSeenInvocationId() if a /invoke
+  // body is present and HMAC validates.
+  setLastSeenInvocationId(undefined);
+
+  // Once the response finishes, snapshot it into the recent-events ring
+  // buffer. We capture status at 'finish' time because handlers may write
+  // through writeSignedTo() multiple times before settling.
+  res.once('finish', () => {
+    const status = res.statusCode || 0;
+    const snap = getMetrics();
+    const invocation_id = snap.last_invocation_id ?? undefined;
+    recordEvent({
+      ts: new Date().toISOString(),
+      method,
+      path: pathOnly,
+      remote,
+      status,
+      verify: status === 401 ? 'fail' : status === 200 || status === 202 ? 'ok' : 'n/a',
+      ...(invocation_id ? { invocation_id } : {}),
+    });
+  });
 
   try {
     if (method === 'GET' && pathOnly === '/health') {
       await handleHealth(res, req);
       return;
     }
+    // Local diagnostic endpoint — no HMAC. See src/metrics.ts for the
+    // security note; gate this behind an admin token in production.
+    if (method === 'GET' && pathOnly === '/__diag') {
+      handleDiag(res, req);
+      return;
+    }
     if (method === 'GET' && pathOnly.startsWith('/tasks/')) {
       const taskId = pathOnly.replace(/\/$/, '').split('/').pop() ?? '';
+      recordP2Poll(taskId);
       await handlePoll(res, req, taskId);
       return;
     }
