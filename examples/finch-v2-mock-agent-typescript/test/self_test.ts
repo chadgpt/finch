@@ -8,15 +8,35 @@
  * Mirrors `deployed-python-mock/self_test.py`.
  *
  * Cross-runtime: runs in both Node 22+ (via tsx) and Deno 2.x (via deno run).
+ *
+ * State persistence: a fresh SQLite file is created in the system temp dir
+ * per run, then removed. Tasks and nonces survive mid-test restarts (i.e.
+ * the server is restarted mid-run to test that the file on disk is
+ * actually read).
  */
 
 import { createHmac, createHash, randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { request as httpRequest, type RequestOptions } from 'node:http';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
 import process from 'node:process';
 import { setTimeout as wait } from 'node:timers/promises';
 import { startServer, type StartedServer, type ProviderConfig } from '../src/provider.ts';
+
+// Unique per-process temp DB. Removed at end of run.
+const dbPath = path.join(
+  os.tmpdir(),
+  `finch-test-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}.db`,
+);
+console.log(`[self_test] using SQLite file: ${dbPath}`);
+process.on('exit', () => {
+  for (const suffix of ['', '-shm', '-wal']) {
+    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+  }
+});
 
 // --- Helpers ---
 
@@ -139,6 +159,8 @@ async function main(): Promise<void> {
     port,
     agentName: 'self-test',
     debugSign: false,
+    // Fresh SQLite file per test run. Cleanup at the end of the run.
+    dbPath: dbPath,
   };
   const server: StartedServer = startServer(cfg);
   // Give the server a tick to start listening.

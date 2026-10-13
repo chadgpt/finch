@@ -26,149 +26,6 @@ npm start            # starts provider
 npm run typecheck    # tsc --noEmit
 ```
 
-## Talking to a real LLM
-
-By default the P1 `conversation_turn` branch calls a real OpenAI-compatible
-LLM at `https://agw.k0s.io` with model `MiniMax-M3`, and uses the model's
-text response as the Agent's reply. P2 / P3 behavior is unchanged (they
-still ask for clarification / echo a mock artifact).
-
-The integration uses the official [`openai`](https://www.npmjs.com/package/openai)
-SDK (v4) — not a hand-rolled HTTP request. The SDK handles auth, JSON
-encoding/decoding, timeouts, and typed errors. To switch to any other
-OpenAI-compatible gateway, just change `LLM_BASE_URL` and `LLM_MODEL`.
-
-Verify it works locally:
-
-```bash
-# 1. start the provider (env vars are read from .env via --env-file in Deno,
-#    or set inline in Node)
-deno task start
-
-# 2. in another terminal, send a signed P1 turn
-python3 - <<'PY'
-import base64, hmac, hashlib, time, uuid, urllib.request, json, os
-key = base64.urlsafe_b64decode(os.environ['MOCK_REQUEST_SECRET'])
-body = json.dumps({
-  "protocol_version": "2.0",
-  "invocation_id": str(uuid.uuid4()),
-  "interaction_mode": "conversation_turn",
-  "input": {"content": [{"type":"text","text":"Reply with exactly the word HELLO and nothing else."}]},
-}).encode()
-ts, n = str(int(time.time())), uuid.uuid4().hex
-canonical = f"POST\n/invoke\n{ts}\n{n}\n{hashlib.sha256(body).hexdigest()}"
-sig = "v1=" + hmac.new(key, canonical.encode(), hashlib.sha256).hexdigest()
-req = urllib.request.Request(
-  "http://127.0.0.1:28891/invoke", data=body, method="POST",
-  headers={
-    "Content-Type": "application/json",
-    "Idempotency-Key": uuid.uuid4().hex,
-    "X-Platform-Key-Id": os.environ["MOCK_KEY_ID"],
-    "X-Platform-Timestamp": ts, "X-Platform-Nonce": n, "X-Platform-Signature": sig,
-  })
-with urllib.request.urlopen(req, timeout=30) as r:
-    print(r.read().decode())
-PY
-```
-
-You should see the LLM's reply in the `message.content[0].text` field.
-End-to-end verified 2026-10-13: a real call to agw.k0s.io with model
-`MiniMax-M3` returned `"HELLO"` (after a 1-2s warm-up).
-
-If the gateway returns an error (e.g. quota), the provider responds with
-`status: "failed"` and an `error.code` you can use for retry logic.
-
-### LLM env vars
-
-| Var | Default | Notes |
-|---|---|---|
-| `LLM_BASE_URL` | `https://agw.k0s.io` | SDK appends `/v1/chat/completions` |
-| `LLM_API_KEY` | `-` | Sentinel; the gateway accepts the literal `-` Bearer |
-| `LLM_MODEL` | `MiniMax-M3` | Verified working model id on this gateway |
-| `LLM_SYSTEM_PROMPT` | `You are a helpful agent. Be concise.` | Prepended to every turn |
-| `LLM_MAX_TOKENS` | `1024` | Per-response cap |
-| `LLM_TIMEOUT_MS` | `30000` | Aborts the HTTP request |
-
-### Switching to Anthropic-style calls
-
-The agw.k0s.io gateway also accepts Anthropic-style POSTs at
-`/v1/messages`. To use the Anthropic SDK instead of the openai SDK,
-replace the `import OpenAI from 'openai'` and the `client.chat.completions.create`
-call in `src/provider.ts` with the equivalent `Anthropic` SDK call. The
-wire-level request shape changes (`system` becomes a top-level field
-instead of a message), but the ProviderConfig env vars stay the same.
-
-### Disabling the LLM (echo fallback)
-
-The test harness sets `llm: undefined` in its `ProviderConfig` to keep
-the original deterministic echo behavior. To do the same at runtime,
-omit `LLM_BASE_URL`:
-
-```bash
-LLM_BASE_URL= deno task start   # falls back to "P1 mock 已完成:<text>"
-```
-
-### Expose it on a public HTTPS URL (for contract test / live demo)
-
-The mock binds to `127.0.0.1`, so Finch cannot reach it directly.
-Two zero-install tunnel options are included:
-
-#### Option A: ufo (recommended, supports persistent subdomains)
-
-[ufo](https://github.com/webteleport/ufo) is an open-source
-WebTransport-based tunnel (MIT, by the webteleport team). `ufo pub`
-allocates a public HTTPS URL on the configured RELAY server and
-forwards to your local port.
-
-```bash
-# install ufo (puts binary in ~/.k0s/bin)
-curl -sL https://k0s.io/install.sh | bash
-export PATH="$HOME/.k0s/bin:$PATH"
-
-# terminal 1
-deno task start
-
-# terminal 2
-# Default: random subdomain on the public ufo relay.
-./scripts/tunnel-ufo.sh
-# -> prints e.g. https://abc123.ufo.k0s.io
-
-# Persistent subdomain: set RELAY to your own ufo relay that supports persistence.
-RELAY=https://ufoufo.k0s.io/finch-dev?persist=1 ./scripts/tunnel-ufo.sh
-# -> prints a stable URL that survives restarts (depends on relay config)
-```
-
-#### Option B: localhost.run (SSH-only fallback, random subdomain)
-
-If ufo doesn't fit (e.g., sandboxed environments), use the SSH-only
-fallback that requires zero software install:
-
-```bash
-# terminal 1
-deno task start
-
-# terminal 2
-./scripts/tunnel.sh
-# -> prints e.g. https://d384eb40cc3a4e.lhr.life
-```
-
-URL is **random per run**; for a stable URL, register a custom domain at
-<https://admin.localhost.run/> and add your SSH public key (see
-<https://localhost.run/docs/forever-free/>).
-
-#### Point Finch at the public URL
-
-| Setting | Value |
-|---|---|
-| `wireProtocol` | `finch_v2` |
-| `invocationUrl` | `https://<public-host>/invoke` |
-| `healthUrl`      | `https://<public-host>/health` |
-| `taskUrl`        | (omit for P1 only) |
-
-End-to-end verified on 2026-10-13: a signed `GET /health` over a
-public tunnel returns `{"status":"ready",...}` with valid `X-Agent-*`
-headers.
-
 ## What this is
 
 - **1:1 mirror of the official Python mock** — every protocol behavior corresponds
@@ -176,16 +33,19 @@ headers.
 - **P1 sync + P2 async + P3 generation** with deterministic `merchant_task_id`
   and HMAC-SHA256 signed responses.
 - **Strict TypeScript** (`noUncheckedIndexedAccess`, strict mode).
-- **No runtime dependencies beyond `openai` SDK** — uses Node 22+ / Deno 2.x
-  built-ins (`node:crypto`, `node:http`, `node:net`, `node:process`) plus
-  the official `openai@^4` package (mapped via `npm:` in Deno, installed
-  normally in Node).
+- **No runtime dependencies** beyond `openai` SDK — uses Node 22+ / Deno 2.x
+  built-ins (`node:crypto`, `node:http`, `node:net`, `node:process`,
+  `node:sqlite`) plus the official `openai@^4` package (mapped via `npm:` in
+  Deno, installed normally in Node).
+- **State persistence** via built-in `node:sqlite` — no Redis, no native
+  modules, no external DB. Same DB file works across server restarts;
+  re-sending the same `Idempotency-Key` returns the same `merchant_task_id`.
 - **Self-contained test** — no Finch account, no external network.
 
 ## What this is NOT
 
-- **Not a production Provider.** State is in-memory, callbacks are not sent, the
-  P3 upload is permissive, cancel is a stub, and the schema validator is minimal.
+- **Not a production Provider.** Callbacks are not sent, the P3 upload is
+  permissive, cancel is a stub, and the schema validator is minimal.
   See "Production checklist" below.
 - **Not affiliated with Finch.** This is a community reference.
 
@@ -194,12 +54,14 @@ headers.
 | File | Purpose |
 |---|---|
 | `src/provider.ts` | The HTTP server (P1/P2/P3 routes) + HMAC + state machine |
+| `src/db.ts` | SQLite-backed store (tasks + nonces) using `node:sqlite` |
 | `test/self_test.ts` | End-to-end test with ephemeral keys (in-process) |
+| `test/e2e_llm.py` | One-shot LLM probe script (sends a signed P1 turn) |
 | `deno.json` | Deno tasks: `start`, `test`, `check` |
-| `package.json` | Node devDeps: `tsx`, `typescript`, `@types/node` |
+| `package.json` | Node devDeps + `openai` runtime dep |
 | `tsconfig.json` | Strict mode, target ES2022, ESM |
 | `.env.example` | Required env vars (placeholders only) |
-| `.gitignore` | Excludes `.env`, `node_modules/` |
+| `.gitignore` | Excludes `.env`, `node_modules/`, `*.db*` |
 
 ## Routes
 
@@ -240,6 +102,33 @@ the workspace. The runtime decodes them via `Buffer.from(s, 'base64url')`.
 | `MOCK_KEY_ID` | yes | `finch.agenton.<uuid>` from your workspace |
 | `MOCK_PORT` | optional | Default `28891` |
 | `MOCK_AGENT_NAME` | optional | Default `finch-async-mock-ts` |
+| `FINCH_DB_PATH` | optional | SQLite file path. Default `./finch-provider.db` |
+| `LLM_*` | optional | See "Talking to a real LLM" section below |
+
+## Talking to a real LLM
+
+The P1 `conversation_turn` branch calls an OpenAI-compatible gateway by
+default (`https://agw.k0s.io`, model `MiniMax-M3`). The integration uses
+the official [`openai`](https://www.npmjs.com/package/openai) SDK v4 — not
+a hand-rolled HTTP request.
+
+Quick verify:
+
+```bash
+# 1. Start the server
+deno task start          # or: npm start
+
+# 2. In another terminal, send a signed P1 turn
+MOCK_KEY_ID=... MOCK_REQUEST_SECRET=... python3 test/e2e_llm.py
+```
+
+You should see `text: '...HELLO'` in the response. End-to-end verified
+2026-10-13 with a real agw.k0s.io call.
+
+To switch to a different OpenAI-compatible gateway, just change
+`LLM_BASE_URL` and `LLM_MODEL`. To switch to Anthropic-style calls, swap
+the SDK in `src/provider.ts` (the env vars stay the same). To disable
+the LLM and use the deterministic echo fallback, leave `LLM_BASE_URL` empty.
 | `DEBUG_SIGN` | optional | Set to `1` to log signature-mismatch diagnostics on the server |
 
 ### Loading env in Deno (no dotenv library needed)
@@ -278,16 +167,52 @@ const srv = startServer({
 // srv.close() to stop
 ```
 
+## State persistence
+
+Tasks and nonces are stored in a local SQLite file at `FINCH_DB_PATH`
+(default `./finch-provider.db`). The schema is auto-migrated on first start:
+
+```sql
+CREATE TABLE tasks (
+  merchant_task_id TEXT PRIMARY KEY,
+  invocation_id    TEXT NOT NULL,
+  state            TEXT NOT NULL,        -- working | input_required | completed
+  sequence         INTEGER NOT NULL,
+  contract_test    INTEGER NOT NULL,
+  answer           TEXT,
+  ready_at         REAL NOT NULL,
+  completed        INTEGER NOT NULL,
+  question         TEXT NOT NULL,
+  mode             TEXT NOT NULL,
+  artifacts_json   TEXT NOT NULL,
+  created_at       REAL NOT NULL
+);
+CREATE TABLE nonces (
+  nonce   TEXT PRIMARY KEY,
+  seen_at REAL NOT NULL
+);
+```
+
+Uses the built-in `node:sqlite` module — no external DB driver, no native
+compilation, no Redis. Available in both Node 22.5+ and Deno 2.x. End-to-end
+verified that a server restart with the same `FINCH_DB_PATH` returns the
+same `merchant_task_id` for a replayed `Idempotency-Key` and a `completed`
+snapshot for tasks that have already advanced.
+
+For multi-process deployments, switch the store to a real RDBMS or Redis
+(see "Production checklist" — the `Store` class in `src/db.ts` is the only
+seam to swap).
+
 ## Production checklist (from the official Python mock)
 
 Before going live:
 
-- [ ] Replace in-memory `_tasks` and `_seenNonces` with Redis or Postgres.
+- [ ] Replace the local SQLite `Store` with a shared RDBMS or Redis if you run
+      multiple processes. Single-process: SQLite is enough.
 - [ ] Implement outbound callback delivery (POST to `callback.url` with the Callback secret).
 - [ ] Strict P3 upload: never fall back to `text/plain`; respect `allowed_media_types` exactly.
 - [ ] Add a real schema validator (Ajv in strict mode) for the full `finch_v2` envelope.
 - [ ] Enforce `limits.deadline_at`; reject overdue invocations before doing real work.
-- [ ] Run multiple processes behind a load balancer; nonces must be shared across processes.
 - [ ] Add structured logging with `invocation_id`, `dispatch_id`, `merchant_task_id`, `credential revision`.
 - [ ] Validate the `output_contract.artifacts` against the `artifact_uploads` you actually consume.
 - [ ] Bind the verifier to a frozen `service_version_id` + `credential revision`; reject requests bound to other revisions.

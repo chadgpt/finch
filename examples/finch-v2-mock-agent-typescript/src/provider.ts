@@ -18,11 +18,14 @@
  * X-Agent-* headers. Wire protocol: finch_v2 — Base64URL-decoded 32-byte secrets.
  *
  * Limitations (intentional, same as the official Python mock):
- *   - State is in-memory and disappears on restart.
  *   - Does not send callbacks to Finch (provider-owned delivery policy).
  *   - Cancel handler is not a complete terminal-state implementation.
  *   - P3 upload is permissive (falls back to text/plain). Not safe for production.
  *   - Does not fully validate incoming protocol schemas.
+ *
+ * State (tasks, nonces) is persisted to a local SQLite file via the built-in
+ * `node:sqlite` module — no Redis, no native deps, available in both
+ * Node 22.5+ and Deno 2.x. The file path defaults to ./finch-provider.db.
  *
  * This file is structured 1:1 with the official Python mock so each block has an
  * obvious correspondence.
@@ -38,6 +41,7 @@ import {
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import process from 'node:process';
+import { Store, type TaskRow } from './db.ts';
 
 // Note: `URL` is a global in both Node 22+ and Deno 2.x, so we use the global
 // form here for cross-runtime compatibility.
@@ -158,24 +162,9 @@ interface TaskSnapshot {
   completed_at?: string;
 }
 
-interface Task {
-  accepted: {
-    protocol_version: '2.0';
-    invocation_id: string;
-    status: 'accepted';
-    merchant_task_id: string;
-    poll_after_ms: number;
-  };
-  state: 'working' | 'input_required';
-  sequence: number;
-  contract_test: boolean;
-  answer: string | null;
-  ready_at: number;
-  completed: boolean;
-  question: string;
-  mode: InteractionMode;
-  artifacts: ArtifactRef[];
-}
+// All task state is now stored in SQLite (see ./db.ts TaskRow).
+// The local `Task` interface has been removed; everything reads/writes
+// TaskRow directly.
 
 // ============================================================
 // Configuration (env-driven; same names as the Python mock)
@@ -200,6 +189,11 @@ export interface ProviderConfig {
   port: number;
   agentName: string;
   debugSign: boolean;
+  /**
+   * Path to the SQLite database file. State (tasks, nonces) persists across
+   * restarts. Defaults to ./finch-provider.db if omitted.
+   */
+  dbPath?: string;
   /** Optional OpenAI-compatible LLM backend for P1 conversation. */
   llm?: LlmConfig;
 }
@@ -253,6 +247,7 @@ export function readConfig(
     maxTokens: parseInt(envReader('LLM_MAX_TOKENS') ?? '1024', 10),
     timeoutMs: parseInt(envReader('LLM_TIMEOUT_MS') ?? '30000', 10),
   };
+  cfg.dbPath = envReader('FINCH_DB_PATH') ?? './finch-provider.db';
   return cfg;
 }
 
@@ -263,6 +258,11 @@ export function readConfig(
 // harness calls startServer() with its own config; the CLI entry point
 // calls startServer() with a config built from env vars.
 let config: ProviderConfig;
+let store: Store | null = null;
+
+// ============================================================
+// Crypto primitives (canonical string + HMAC-SHA256)
+// ============================================================
 
 // ============================================================
 // Crypto primitives (canonical string + HMAC-SHA256)
@@ -298,38 +298,19 @@ function safeEq(a: string, b: string): boolean {
 }
 
 // ============================================================
-// In-memory state — replace this with Redis/Postgres for production
 // ============================================================
+// State (SQLite via node:sqlite) — see ./db.ts
+// ============================================================
+// All state is read/written through the `store` global, which is initialized
+// in startServer(). Tests pass a per-run temp file; CLI passes a persistent
+// file at ./finch-provider.db (or $FINCH_DB_PATH).
 
-const _lock = (() => {
-  // Simple async mutex (single-process). For multi-process use a real lock.
-  let chain: Promise<unknown> = Promise.resolve();
-  return async <T>(fn: () => Promise<T> | T): Promise<T> => {
-    const next = chain.then(fn);
-    chain = next.catch(() => undefined);
-    return next as Promise<T>;
-  };
-})();
-
-const _tasks = new Map<string, Task>();
-const _seenNonces = new Map<string, number>();
-const NONCE_TTL_SEC = 600;
 const SKEW_TOLERANCE_SEC = 300;
+const NONCE_TTL_SEC = 600;
 
-function purgeExpiredNonces(now: number): void {
-  for (const [n, at] of _seenNonces) {
-    if (now - at > NONCE_TTL_SEC) _seenNonces.delete(n);
-  }
-}
-
-async function consumeNonce(nonce: string): Promise<boolean> {
-  return _lock(() => {
-    const now = Date.now() / 1000;
-    purgeExpiredNonces(now);
-    if (_seenNonces.has(nonce)) return false;
-    _seenNonces.set(nonce, now);
-    return true;
-  });
+function consumeNonce(nonce: string): boolean {
+  if (!store) throw new Error('store not initialized');
+  return store.consumeNonce(nonce, NONCE_TTL_SEC);
 }
 
 function makeMerchantTaskId(invocationId: string, idempotencyKey: string): string {
@@ -433,7 +414,7 @@ async function verifyPlatform(req: IncomingMessage, body: Buffer): Promise<boole
     return false;
   }
   // Replay check (must happen BEFORE signature check; mocked Python does it inline)
-  if (!(await consumeNonce(nonce))) {
+  if (!consumeNonce(nonce)) {
     // Replay — return 409 with signed body. We need res from caller, so this is
     // signalled by returning 'replay' and letting the handler respond.
     throw new VerificationRejection('nonce_replay', 409);
@@ -671,42 +652,53 @@ async function handleInvoke(
   const parameters = payload.input?.parameters ?? {};
   const contractTest = parameters.contract_test === true;
 
-  const created = await _lock(async () => {
-    const existing = _tasks.get(merchantTaskId);
-    if (existing) return { task: existing, isNew: false };
-    const task: Task = {
-      accepted: {
-        protocol_version: '2.0',
-        invocation_id: invocationId,
-        status: 'accepted',
-        merchant_task_id: merchantTaskId,
-        poll_after_ms: 500,
-      },
-      state: 'working',
-      sequence: 1,
-      contract_test: contractTest,
-      answer: null,
-      ready_at: Date.now() / 1000 + (contractTest ? 0.6 : 0.5),
-      completed: false,
-      question: '请补充说明你期望的具体安排(时间、范围或约束)。',
-      mode,
-      artifacts: [],
-    };
-    if (mode === 'generation') {
-      const slots = payload.artifact_uploads ?? [];
-      task.artifacts = await uploadSlots(slots);
-    }
-    _tasks.set(merchantTaskId, task);
-    return { task, isNew: true };
-  });
+  if (!store) throw new Error('store not initialized');
 
-  if (!created.isNew) {
-    // Replay of an accepted dispatch: return the same accepted envelope.
-    writeSignedTo(res, req, 202, created.task.accepted);
+  // Idempotency: same invocation_id + same Idempotency-Key -> same task.
+  const existing = store.getTask(merchantTaskId);
+  if (existing) {
+    // Replay: return the persisted accepted envelope.
+    writeSignedTo(res, req, 202, {
+      protocol_version: '2.0',
+      invocation_id: existing.invocation_id,
+      status: 'accepted',
+      merchant_task_id: merchantTaskId,
+      poll_after_ms: 500,
+    });
     return;
   }
 
-  writeSignedTo(res, req, 202, created.task.accepted);
+  const task: TaskRow = {
+    merchant_task_id: merchantTaskId,
+    invocation_id: invocationId,
+    state: 'working',
+    sequence: 1,
+    contract_test: contractTest,
+    answer: null,
+    ready_at: Date.now() / 1000 + (contractTest ? 0.6 : 0.5),
+    completed: false,
+    question: '请补充说明你期望的具体安排(时间、范围或约束)。',
+    mode,
+    artifacts_json: '[]',
+    created_at: Date.now() / 1000,
+  };
+
+  // P3 only: upload artifacts before persisting the task.
+  if (mode === 'generation') {
+    const slots = payload.artifact_uploads ?? [];
+    const artifacts = await uploadSlots(slots);
+    task.artifacts_json = JSON.stringify(artifacts);
+  }
+
+  store.insertTask(task);
+
+  writeSignedTo(res, req, 202, {
+    protocol_version: '2.0',
+    invocation_id: invocationId,
+    status: 'accepted',
+    merchant_task_id: merchantTaskId,
+    poll_after_ms: 500,
+  });
 }
 
 async function uploadSlots(slots: ArtifactUploadSlot[]): Promise<ArtifactRef[]> {
@@ -754,11 +746,12 @@ async function uploadSlots(slots: ArtifactUploadSlot[]): Promise<ArtifactRef[]> 
   return out;
 }
 
-function taskSnapshot(task: Task): TaskSnapshot {
+function taskSnapshot(task: TaskRow): TaskSnapshot {
   const common = {
     protocol_version: '2.0' as const,
-    merchant_task_id: task.accepted.merchant_task_id,
+    merchant_task_id: task.merchant_task_id,
   };
+  const artifacts: ArtifactRef[] = JSON.parse(task.artifacts_json) as ArtifactRef[];
   if (task.completed) {
     const answerText = task.answer ?? '(无补充)';
     if (task.mode === 'generation') {
@@ -771,7 +764,7 @@ function taskSnapshot(task: Task): TaskSnapshot {
           role: 'agent',
           content: [{ type: 'text', text: 'P3 mock 已完成生成。' }],
         },
-        artifacts: task.artifacts,
+        artifacts,
       };
     }
     return {
@@ -797,19 +790,29 @@ function taskSnapshot(task: Task): TaskSnapshot {
       questions: [{ id: 'detail', question: task.question }],
     };
   }
+  // Working state: check if ready_at has elapsed and advance.
   if (now >= task.ready_at) {
+    if (!store) throw new Error('store not initialized');
     if (task.contract_test || task.mode === 'generation') {
-      task.completed = true;
-      task.sequence += 1;
-      return taskSnapshot(task);
+      const completed: TaskRow = {
+        ...task,
+        completed: true,
+        sequence: task.sequence + 1,
+      };
+      store.upsertTask(completed);
+      return taskSnapshot(completed);
     }
-    task.state = 'input_required';
-    task.sequence += 1;
+    const advanced: TaskRow = {
+      ...task,
+      state: 'input_required',
+      sequence: task.sequence + 1,
+    };
+    store.upsertTask(advanced);
     return {
       ...common,
       status: 'input_required',
-      sequence: task.sequence,
-      questions: [{ id: 'detail', question: task.question }],
+      sequence: advanced.sequence,
+      questions: [{ id: 'detail', question: advanced.question }],
     };
   }
   return {
@@ -838,7 +841,8 @@ async function handlePoll(
     throw e;
   }
 
-  const task = _tasks.get(taskId);
+  if (!store) throw new Error('store not initialized');
+  const task = store.getTask(taskId);
   if (!task) {
     writeSignedTo(res, req, 404, { code: 'task_not_found' });
     return;
@@ -874,15 +878,19 @@ async function handleMessages(
     return;
   }
 
-  await _lock(() => {
-    const task = _tasks.get(taskId);
+  if (!store) throw new Error('store not initialized');
+  let responseStatus = 200;
+  let responseBody: unknown = { code: 'unknown' };
+  store.updateTask(taskId, (task) => {
     if (!task) {
-      writeSignedTo(res, req, 404, { code: 'task_not_found' });
-      return;
+      responseStatus = 404;
+      responseBody = { code: 'task_not_found' };
+      return null;
     }
     if (task.completed || task.state !== 'input_required') {
-      writeSignedTo(res, req, 409, { code: 'task_not_awaiting_input' });
-      return;
+      responseStatus = 409;
+      responseBody = { code: 'task_not_awaiting_input' };
+      return null;
     }
     let answer = '';
     for (const part of payload.message?.content ?? []) {
@@ -890,15 +898,21 @@ async function handleMessages(
         answer = (answer + ' ' + part.text).trim();
       }
     }
-    task.answer = answer.slice(0, 500);
-    task.completed = true;
-    task.sequence += 1;
-    writeSignedTo(res, req, 202, {
+    const updated: TaskRow = {
+      ...task,
+      answer: answer.slice(0, 500),
+      completed: true,
+      sequence: task.sequence + 1,
+    };
+    responseStatus = 202;
+    responseBody = {
       protocol_version: '2.0',
       status: 'accepted',
       merchant_task_id: taskId,
-    });
+    };
+    return updated;
   });
+  writeSignedTo(res, req, responseStatus, responseBody);
 }
 
 async function handleCancel(
@@ -920,25 +934,35 @@ async function handleCancel(
     throw e;
   }
 
-  await _lock(() => {
-    const task = _tasks.get(taskId);
+  if (!store) throw new Error('store not initialized');
+  let responseStatus = 200;
+  let responseBody: unknown = { code: 'unknown' };
+  store.updateTask(taskId, (task) => {
     if (!task) {
-      writeSignedTo(res, req, 404, { code: 'task_not_found' });
-      return;
+      responseStatus = 404;
+      responseBody = { code: 'task_not_found' };
+      return null;
     }
     if (task.completed) {
-      writeSignedTo(res, req, 409, { code: 'task_terminal' });
-      return;
+      responseStatus = 409;
+      responseBody = { code: 'task_terminal' };
+      return null;
     }
-    task.completed = true;
-    task.sequence += 1;
-    writeSignedTo(res, req, 200, {
+    const updated: TaskRow = {
+      ...task,
+      completed: true,
+      sequence: task.sequence + 1,
+    };
+    responseStatus = 200;
+    responseBody = {
       protocol_version: '2.0',
       status: 'canceled',
       merchant_task_id: taskId,
-      sequence: task.sequence,
-    });
+      sequence: updated.sequence,
+    };
+    return updated;
   });
+  writeSignedTo(res, req, responseStatus, responseBody);
 }
 
 // ============================================================
@@ -1016,6 +1040,7 @@ export function startServer(c: ProviderConfig): StartedServer {
     throw new Error('FATAL: keyId is required');
   }
   config = c;
+  store = new Store(c.dbPath ?? './finch-provider.db');
   const server = buildServer();
   server.listen(c.port, '127.0.0.1', () => {
     console.log(`${c.agentName} listening on 127.0.0.1:${c.port}`);
@@ -1024,7 +1049,17 @@ export function startServer(c: ProviderConfig): StartedServer {
     port: c.port,
     close: () =>
       new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
+        server.close((err) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          if (store) {
+            store.close();
+            store = null;
+          }
+          resolve();
+        });
       }),
   };
 }
