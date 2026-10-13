@@ -3,8 +3,8 @@
     "start": "deno run --allow-net --allow-env --allow-read --allow-write src/provider.ts",
     "cli": "deno run --allow-net --allow-env --allow-read --allow-write --allow-sys src/cli.ts",
     "test": "deno test --allow-net --allow-env --allow-read --allow-write src/history.test.ts",
-    "test:all": "deno run --allow-net --allow-env --allow-read --allow-write test/self_test.ts && deno test --allow-net --allow-env --allow-read --allow-write src/history.test.ts && deno run --allow-net --allow-env --allow-read --allow-write test/diag_test.ts && deno run --allow-net --allow-env --allow-read --allow-write --allow-sys test/agent_test.ts",
-    "check": "deno check src/provider.ts src/cli.ts src/agent.ts src/llm.ts src/db.ts src/history.ts src/metrics.ts test/self_test.ts test/diag_test.ts test/agent_test.ts"
+    "test:all": "deno run --allow-net --allow-env --allow-read --allow-write test/self_test.ts && deno test --allow-net --allow-env --allow-read --allow-write src/history.test.ts && deno run --allow-net --allow-env --allow-read --allow-write test/diag_test.ts && deno run --allow-net --allow-env --allow-read --allow-write --allow-sys test/agent_test.ts && deno run --allow-net --allow-env --allow-read --allow-write --allow-sys test/p2_llm_test.ts",
+    "check": "deno check src/provider.ts src/cli.ts src/agent.ts src/llm.ts src/db.ts src/history.ts src/metrics.ts src/p2.ts test/self_test.ts test/diag_test.ts test/agent_test.ts test/p2_llm_test.ts"
   },
   "imports": {
     "@earendil-works/pi-ai": "npm:@earendil-works/pi-ai@^1.2.0",

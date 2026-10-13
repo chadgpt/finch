@@ -220,7 +220,7 @@ export interface LlmConfig {
   systemPrompt?: string;
   /** Max tokens for the LLM response. Default 1024. */
   maxTokens?: number;
-  /** Request timeout in ms. Default 30000. */
+  /** Per-call timeout. Default 30000. */
   timeoutMs?: number;
 }
 
@@ -486,12 +486,27 @@ class VerificationRejection extends Error {
 import {
   createLlmProvider,
   LlmError,
+  type LlmConfig as RuntimeLlmConfig,
   type LlmProvider,
 } from './llm.ts';
 import { runAgentTurn } from './agent.ts';
+import { runP2Decision, applyP2Decision } from './p2.ts';
 
 let _llmProvider: LlmProvider | null = null;
 let _llmProviderConfig: LlmConfig | null = null;
+
+// ProviderConfig.llm has all fields optional (env vars may be unset);
+// the LlmProvider expects them required. Bridge the two with defaults.
+function normalizeLlmConfig(llm: ProviderConfig['llm']): RuntimeLlmConfig {
+  return {
+    baseUrl: llm?.baseUrl ?? 'https://agw.k0s.io/v1',
+    apiKey: llm?.apiKey ?? '-',
+    model: llm?.model ?? 'MiniMax-M3',
+    systemPrompt: llm?.systemPrompt ?? 'You are a helpful agent. Be concise.',
+    maxTokens: llm?.maxTokens ?? 1024,
+    timeoutMs: llm?.timeoutMs ?? 30000,
+  };
+}
 
 function llmProvider(llm: LlmConfig): LlmProvider {
   if (_llmProvider && _llmProviderConfig === llm) return _llmProvider;
@@ -682,6 +697,22 @@ async function handleInvoke(
     return;
   }
 
+  // Pull the user text out of the request once — reused by both the
+  // LLM driver and the deterministic fallback.
+  const userText = (() => {
+    const parts = payload.input?.content ?? [];
+    return parts
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('\n')
+      .trim();
+  })();
+
+  // When the LLM is configured, push the deterministic timers out so
+  // the platform's poll loop doesn't see the task "auto-advance" before
+  // the agent has had a chance to decide. The async driver below will
+  // move the task to input_required or completed when it's done.
+  const hasLlm = config.llm !== undefined;
   const task: TaskRow = {
     merchant_task_id: merchantTaskId,
     invocation_id: invocationId,
@@ -689,7 +720,9 @@ async function handleInvoke(
     sequence: 1,
     contract_test: contractTest,
     answer: null,
-    ready_at: Date.now() / 1000 + (contractTest ? 0.6 : 0.5),
+    // 30s gives the LLM room to answer. The async driver short-circuits
+    // this when it commits the decision; the timer is only the safety net.
+    ready_at: Date.now() / 1000 + (hasLlm ? 30 : (contractTest ? 0.6 : 0.5)),
     completed: false,
     question: '请补充说明你期望的具体安排(时间、范围或约束)。',
     mode,
@@ -705,6 +738,34 @@ async function handleInvoke(
   }
 
   store.insertTask(task);
+
+  // Async LLM driver — does not block the 202 reply. The platform will
+  // poll /tasks/{id} and see input_required or completed once the
+  // agent commits its decision. Errors are caught and logged so a
+  // misbehaving LLM doesn't crash the process.
+  if (hasLlm && config.llm) {
+    const cfg = normalizeLlmConfig(config.llm);
+    void runP2Decision(store, merchantTaskId, userText, cfg).then(
+      (decision) => {
+        if (!store) return;
+        store.updateTask(merchantTaskId, (t) => (t ? applyP2Decision(t, decision) : null));
+        // Fire the callback-side metrics hook.
+        recordEvent({
+          ts: new Date().toISOString(),
+          method: '(agent)',
+          path: `/tasks/${merchantTaskId}`,
+          remote: 'agent',
+          status: decision.state === 'completed' ? 200 : 202,
+          verify: 'n/a',
+          ...(decision.state === 'completed' ? { task_id: merchantTaskId } : {}),
+          invocation_id: invocationId,
+        });
+      },
+      (err) => {
+        console.error('p2 driver failed', merchantTaskId, err);
+      },
+    );
+  }
 
   writeSignedTo(res, req, 202, {
     protocol_version: '2.0',
@@ -767,7 +828,7 @@ function taskSnapshot(task: TaskRow): TaskSnapshot {
   };
   const artifacts: ArtifactRef[] = JSON.parse(task.artifacts_json) as ArtifactRef[];
   if (task.completed) {
-    const answerText = task.answer ?? '(无补充)';
+    const answerText = task.answer ?? '';
     if (task.mode === 'generation') {
       return {
         ...common,
@@ -776,7 +837,7 @@ function taskSnapshot(task: TaskRow): TaskSnapshot {
         completed_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
         message: {
           role: 'agent',
-          content: [{ type: 'text', text: 'P3 mock 已完成生成。' }],
+          content: [{ type: 'text', text: answerText || 'P3 mock 已完成生成。' }],
         },
         artifacts,
       };
@@ -789,7 +850,7 @@ function taskSnapshot(task: TaskRow): TaskSnapshot {
       message: {
         role: 'agent',
         content: [
-          { type: 'text', text: `已收到你的补充说明:「${answerText}」。任务已完成。` },
+          { type: 'text', text: answerText || '(empty answer)' },
         ],
       },
       artifacts: [],
@@ -895,6 +956,7 @@ async function handleMessages(
   if (!store) throw new Error('store not initialized');
   let responseStatus = 200;
   let responseBody: unknown = { code: 'unknown' };
+  let userReply = '';
   store.updateTask(taskId, (task) => {
     if (!task) {
       responseStatus = 404;
@@ -912,10 +974,15 @@ async function handleMessages(
         answer = (answer + ' ' + part.text).trim();
       }
     }
+    userReply = answer;
+    // Move the task back to 'working' so subsequent polls see the
+    // LLM driver is in progress. The driver will flip it to
+    // 'completed' when the agent commits the final answer.
     const updated: TaskRow = {
       ...task,
-      answer: answer.slice(0, 500),
-      completed: true,
+      state: 'working',
+      // 30s safety net; the async driver will commit sooner.
+      ready_at: Date.now() / 1000 + (config.llm ? 30 : 0.5),
       sequence: task.sequence + 1,
     };
     responseStatus = 202;
@@ -926,6 +993,48 @@ async function handleMessages(
     };
     return updated;
   });
+  if (responseStatus === 404 || responseStatus === 409) {
+    writeSignedTo(res, req, responseStatus, responseBody);
+    return;
+  }
+
+  // Async LLM driver for the supplemental turn (P2).
+  if (config.llm && userReply) {
+    const cfg = normalizeLlmConfig(config.llm);
+    const invocationId = store.getTask(taskId)?.invocation_id ?? '';
+    void runP2Decision(store, taskId, userReply, cfg).then(
+      (decision) => {
+        if (!store) return;
+        store.updateTask(taskId, (t) => (t ? applyP2Decision(t, decision) : null));
+        recordEvent({
+          ts: new Date().toISOString(),
+          method: '(agent)',
+          path: `/tasks/${taskId}/messages`,
+          remote: 'agent',
+          status: decision.state === 'completed' ? 200 : 202,
+          verify: 'n/a',
+          task_id: taskId,
+          ...(invocationId ? { invocation_id: invocationId } : {}),
+        });
+      },
+      (err) => {
+        console.error('p2 supplemental driver failed', taskId, err);
+      },
+    );
+  } else {
+    // No LLM: deterministic echo completion (preserves the original
+    // self_test contract).
+    store.updateTask(taskId, (task) => {
+      if (!task) return null;
+      return {
+        ...task,
+        completed: true,
+        answer: userReply.slice(0, 500),
+        sequence: task.sequence + 1,
+      };
+    });
+  }
+
   writeSignedTo(res, req, responseStatus, responseBody);
 }
 

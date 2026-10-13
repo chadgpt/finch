@@ -142,7 +142,7 @@ export class Store {
     this.updateTaskStateStmt = this.db.prepare(`
       UPDATE tasks
          SET state = ?, sequence = ?, answer = ?, completed = ?,
-             artifacts_json = ?
+             artifacts_json = ?, question = ?
        WHERE merchant_task_id = ?
     `);
     this.getNonceStmt = this.db.prepare('SELECT seen_at FROM nonces WHERE nonce = ?');
@@ -235,6 +235,7 @@ export class Store {
       updated.answer,
       updated.completed ? 1 : 0,
       updated.artifacts_json,
+      updated.question,
       id,
     );
     return updated;

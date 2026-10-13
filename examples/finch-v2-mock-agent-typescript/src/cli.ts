@@ -186,13 +186,36 @@ async function startSubcommand(): Promise<void> {
   await new Promise(() => {});
 }
 
+async function tuiSubcommand(): Promise<void> {
+  // The TUI is interactive — only run on a TTY. For sandbox/CI runs,
+  // the user can fall back to `finch ask --prompt "..."`.
+  if (!process.stdout.isTTY) {
+    console.error('tui: stdout is not a TTY. Use `finch ask --prompt "..."` instead.');
+    process.exit(2);
+  }
+  const { ChatTui } = await import('./tui.ts');
+  const { Store } = await import('./db.ts');
+  const baseUrl = process.env.LLM_BASE_URL ?? 'https://agw.k0s.io/v1';
+  const apiKey = process.env.LLM_API_KEY ?? '-';
+  const model = process.env.LLM_MODEL ?? 'MiniMax-M3';
+  const systemPrompt = process.env.LLM_SYSTEM_PROMPT ?? 'You are a helpful agent. Be concise.';
+  const maxTokens = parseInt(process.env.LLM_MAX_TOKENS ?? '1024', 10);
+  const timeoutMs = parseInt(process.env.LLM_TIMEOUT_MS ?? '30000', 10);
+  const dbPath = process.env.FINCH_DB_PATH ?? '/tmp/finch-tui.db';
+  const config = { baseUrl, apiKey, model, systemPrompt, maxTokens, timeoutMs };
+  const tui = new ChatTui(config, new Store(dbPath));
+  tui.start();
+}
+
 async function main(): Promise<void> {
   const sub = process.argv[2];
   if (sub === 'start') return startSubcommand();
   if (sub === 'ask') return askSubcommand(process.argv.slice(3));
+  if (sub === 'tui') return tuiSubcommand();
   console.error('Usage:');
   console.error('  finch start                  # run HTTP server');
   console.error('  finch ask [--prompt "..."]   # interactive REPL or one-shot');
+  console.error('  finch tui                    # full TUI chat (TTY only)');
   process.exit(1);
 }
 

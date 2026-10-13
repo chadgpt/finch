@@ -49,8 +49,9 @@ npm run typecheck    # tsc --noEmit
 - **Three subcommands** via `npx tsx src/cli.ts`:
   - `start` — HTTP provider
   - `ask` — interactive REPL or `--prompt "..."` one-shot
-  - (TUI components are wired but the REPL uses a minimal spinner; swap
-    in `@earendil-works/pi-tui` for the full chat experience)
+  - `tui` — full TUI chat (TTY-only) built on `@earendil-works/pi-tui`
+    with streaming text deltas, tool-call rendering, multi-turn
+    SQLite-backed history
 - **Strict TypeScript** (`noUncheckedIndexedAccess`, strict mode).
 - **State persistence** via built-in `node:sqlite` — no Redis, no native
   modules, no external DB. Same DB file works across server restarts;
@@ -58,8 +59,12 @@ npm run typecheck    # tsc --noEmit
 - **Three test suites**:
   - `test/self_test.ts` — 6/6 protocol-level checks (no LLM, no network)
   - `src/history.test.ts` — 8/8 store + LLM-history conversion
+  - `test/diag_test.ts` — 6/6 `/__diag` metrics endpoint
   - `test/agent_test.ts` — 4/4 end-to-end against a real LLM
     (single-turn, multi-turn, tool use, streaming)
+  - `test/p2_llm_test.ts` — 3/3 P2 + P3 driven by the LLM through
+    `runP2Decision` (clear question → completed, ambiguous →
+    input_required + supplemental → completed, P3 generation → completed)
 
 ## What this is NOT
 
