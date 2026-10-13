@@ -1,0 +1,20 @@
+{
+  "name": "finch-provider-ts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript reference implementation of a Finch finch_v2 Provider. Mirrors the official Python mock (deployed-python-mock/app.py).",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "tsx src/provider.ts",
+    "test": "tsx test/self_test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

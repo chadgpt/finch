@@ -1,0 +1,19 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net --allow-env --allow-read --allow-write src/provider.ts",
+    "test": "deno run --allow-net --allow-env --allow-read --allow-write test/self_test.ts",
+    "check": "deno check src/provider.ts test/self_test.ts"
+  },
+  "imports": {
+    "node:crypto": "node:crypto",
+    "node:http": "node:http",
+    "node:net": "node:net",
+    "node:process": "node:process",
+    "node:timers/promises": "node:timers/promises"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "lib": ["ES2022", "DOM"]
+  }
+}
